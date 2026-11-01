@@ -1,0 +1,41 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Build output
+build/
+dist/
+*.egg-info/
+*.app/
+
+# Private or runtime data
+.env
+.env.*
+*.cookies
+cookies*.txt
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Large media
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.mp3
+*.m4a
+*.wav
+*.flac
