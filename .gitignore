@@ -39,3 +39,6 @@ cookies*.txt
 *.m4a
 *.wav
 *.flac
+
+# Local notes for Claude Code
+CLAUDE.md
