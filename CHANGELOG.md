@@ -2,6 +2,24 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 1.3.0 — 2026-11-02
+
+- Redesigned window: app icon and version badge, Source → Destination folder cards with drop targets, free space and "drive not connected" warnings, and a progress card with size, speed, time left and the current file.
+- New Preview button that lists what's missing (and its total size) without copying anything.
+- Activity log can be filtered (Copied / To copy / Problems), copied to the clipboard, and the destination opened in Finder.
+- New `make_launcher.py` builds `Copy Missing Files.app` with the app icon and version and installs it in Applications.
+- Copy logic moved to `copy_core.py`, shared by the PySide6 and Tkinter apps.
+- Fix: an interrupted copy left a half-written file that later runs treated as already copied; files are now written under a temporary name and renamed when complete.
+- Fix: with the external drive unplugged, the destination path was recreated under `/Volumes` on the internal disk and filled there; a missing drive is now reported, also if it disconnects mid-copy.
+- Fix: folders that couldn't be read were silently skipped; they're now reported as failures.
+- Fix: the destination folder was created before checking it wasn't inside the source.
+- Fix: a full destination drive failed every remaining file; free space is now checked first and the copy stops if the drive fills up.
+- Fix: Cancel only took effect between files; it now stops within a large file and removes the partial copy.
+- Fix: per-file UI updates slowed large copies; updates are now batched.
+- Fix: a settings file that wasn't a JSON object crashed the app at startup.
+- Fix: the Tkinter app quit mid-copy without asking.
+- Tests no longer read the real settings file.
+
 ## 1.2.0 — 2026-11-01
 
 - Show the version number in the window title.

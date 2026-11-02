@@ -1,12 +1,12 @@
 import errno
 import json
 import os
-import shutil
-import stat
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+
+import copy_core
 
 
 APP_NAME = "Copy Missing Files"
@@ -34,6 +34,7 @@ class CopyMissingFilesApp:
         self.progress_var = tk.DoubleVar(value=0)
 
         self.copying = False
+        self.cancel_requested = False
 
         self.load_settings()
         self.build_gui()
@@ -163,6 +164,9 @@ class CopyMissingFilesApp:
             ) as file:
                 settings = json.load(file)
 
+            if not isinstance(settings, dict):
+                return
+
             source = settings.get("source", "")
             destination = settings.get("destination", "")
 
@@ -266,73 +270,19 @@ class CopyMissingFilesApp:
         if self.copying:
             return
 
-        source_text = self.source_var.get().strip()
-        destination_text = (
-            self.destination_var.get().strip()
-        )
-
-        if not source_text:
-            messagebox.showerror(
-                "Missing Source",
-                "Select a source folder.",
-            )
-            return
-
-        if not destination_text:
-            messagebox.showerror(
-                "Missing Destination",
-                "Select a destination folder.",
-            )
-            return
-
-        source = Path(source_text)
-        destination = Path(destination_text)
-
-        if not source.is_dir():
-            messagebox.showerror(
-                "Invalid Source",
-                "The source folder does not exist.",
-            )
-            return
-
         try:
-            destination.mkdir(
-                parents=True,
-                exist_ok=True,
+            source, destination = copy_core.check_folders(
+                self.source_var.get(),
+                self.destination_var.get(),
             )
-        except OSError as error:
-            messagebox.showerror(
-                "Destination Error",
-                str(error),
-            )
+        except copy_core.FolderError as error:
+            messagebox.showerror(error.title, error.message)
             return
-
-        try:
-            source_resolved = source.resolve()
-            destination_resolved = destination.resolve()
-
-            if source_resolved == destination_resolved:
-                messagebox.showerror(
-                    "Invalid Folders",
-                    "Source and destination cannot "
-                    "be the same folder.",
-                )
-                return
-
-            if source_resolved in destination_resolved.parents:
-                messagebox.showerror(
-                    "Invalid Destination",
-                    "The destination cannot be inside "
-                    "the source folder.",
-                )
-                return
-
-        except OSError:
-            pass
 
         self.save_settings()
 
         self.copying = True
+        self.cancel_requested = False
         self.start_button.configure(state="disabled")
 
         self.progress_var.set(0)
@@ -348,52 +298,8 @@ class CopyMissingFilesApp:
         )
         thread.start()
 
-    def scan_items(self, source):
-        items = []
-
-        for root_dir, dir_names, file_names in os.walk(
-            source,
-            topdown=True,
-            followlinks=False,
-        ):
-            root_path = Path(root_dir)
-
-            real_directories = []
-
-            for directory_name in dir_names:
-                directory_path = (
-                    root_path / directory_name
-                )
-
-                try:
-                    info = os.lstat(directory_path)
-
-                    if stat.S_ISLNK(info.st_mode):
-                        items.append(directory_path)
-                    else:
-                        real_directories.append(
-                            directory_name
-                        )
-
-                except OSError as error:
-                    if error.errno == errno.ENOENT:
-                        items.append(directory_path)
-                    else:
-                        self.log(
-                            "Scan warning: "
-                            + str(directory_path)
-                            + " - "
-                            + str(error)
-                        )
-
-            dir_names[:] = real_directories
-
-            for file_name in file_names:
-                items.append(
-                    root_path / file_name
-                )
-
-        return items
+    def is_cancelled(self):
+        return self.cancel_requested
 
     def copy_worker(self, source, destination):
         copied = 0
@@ -404,248 +310,103 @@ class CopyMissingFilesApp:
             self.set_status("Scanning source folder...")
             self.log("Scanning source folder...")
 
-            items = self.scan_items(source)
+            plan = copy_core.build_plan(
+                source,
+                destination,
+                self.is_cancelled,
+            )
 
-            total = len(items)
+            skipped = len(plan.skipped)
+            failed = len(plan.errors)
+
+            for relative_path, reason in plan.skipped:
+                self.log("Skipped: " + str(relative_path) + " - " + reason)
+
+            for error_path, reason in plan.errors:
+                self.log("Failed: " + str(error_path) + " - " + reason)
+
+            skipped += plan.existing
+            total = len(plan.items)
 
             self.log(
                 "Found "
                 + f"{total:,}"
-                + " items."
+                + " missing items ("
+                + copy_core.format_size(plan.total_bytes)
+                + ")."
             )
 
-            if total == 0:
-                self.finish_copy(
-                    copied,
-                    skipped,
-                    failed,
+            free = copy_core.free_space(destination)
+
+            if free is not None and plan.total_bytes > free:
+                self.log(
+                    "Not enough space on the destination drive: needs "
+                    + copy_core.format_size(plan.total_bytes)
+                    + ", only "
+                    + copy_core.format_size(free)
+                    + " free. Nothing was copied."
                 )
+                self.finish_copy(copied, skipped, failed)
                 return
 
-            for index, source_path in enumerate(
-                items,
-                start=1,
-            ):
+            if plan.items and not destination.exists():
+                destination.mkdir()
+
+            for index, item in enumerate(plan.items, start=1):
+                self.set_status(
+                    "Copying "
+                    + f"{index:,}"
+                    + " of "
+                    + f"{total:,}"
+                )
+                self.set_progress(index / total * 100)
+
                 try:
-                    relative_path = (
-                        source_path.relative_to(source)
-                    )
-
-                    destination_path = (
-                        destination / relative_path
-                    )
-
-                    self.set_status(
-                        "Processing "
-                        + f"{index:,}"
-                        + " of "
-                        + f"{total:,}"
-                    )
-
-                    progress = (
-                        index / total
-                    ) * 100
-
-                    self.set_progress(progress)
-
-                    try:
-                        source_info = os.lstat(
-                            source_path
-                        )
-
-                    except OSError as error:
-                        if error.errno == errno.ENOENT:
-                            skipped += 1
-                            self.log(
-                                "Skipped unavailable: "
-                                + str(relative_path)
-                            )
-                            continue
-
-                        raise
-
-                    if os.path.lexists(
-                        destination_path
+                    if copy_core.copy_item(
+                        item,
+                        destination,
+                        should_cancel=self.is_cancelled,
                     ):
-                        skipped += 1
-                        continue
-
-                    destination_path.parent.mkdir(
-                        parents=True,
-                        exist_ok=True,
-                    )
-
-                    if stat.S_ISLNK(
-                        source_info.st_mode
-                    ):
-                        try:
-                            link_target = os.readlink(
-                                source_path
-                            )
-
-                            os.symlink(
-                                link_target,
-                                destination_path,
-                            )
-
-                            copied += 1
-
-                            self.log(
-                                "Copied symlink: "
-                                + str(relative_path)
-                            )
-
-                        except OSError as error:
-                            if error.errno == errno.ENOENT:
-                                skipped += 1
-                                self.log(
-                                    "Skipped unavailable "
-                                    "symlink: "
-                                    + str(relative_path)
-                                )
-                            else:
-                                raise
-
-                        continue
-
-                    if not stat.S_ISREG(
-                        source_info.st_mode
-                    ):
-                        skipped += 1
-                        self.log(
-                            "Skipped special item: "
-                            + str(relative_path)
-                        )
-                        continue
-
-                    try:
-                        shutil.copy2(
-                            source_path,
-                            destination_path,
-                        )
-
-                    except FileNotFoundError:
+                        copied += 1
+                        self.log("Copied: " + str(item.relative))
+                    else:
                         skipped += 1
 
-                        self.log(
-                            "Skipped unavailable: "
-                            + str(relative_path)
-                        )
-
-                        continue
-
-                    except OSError as error:
-                        if error.errno == errno.ENOENT:
-                            skipped += 1
-
-                            self.log(
-                                "Skipped unavailable: "
-                                + str(relative_path)
-                            )
-
-                            continue
-
-                        # copy2 can fail on some macOS
-                        # metadata or extended attributes.
-                        # Try a basic file copy instead.
-                        try:
-                            shutil.copyfile(
-                                source_path,
-                                destination_path,
-                            )
-
-                        except FileNotFoundError:
-                            skipped += 1
-
-                            self.log(
-                                "Skipped unavailable: "
-                                + str(relative_path)
-                            )
-
-                            continue
-
-                        except OSError as fallback_error:
-                            if (
-                                fallback_error.errno
-                                == errno.ENOENT
-                            ):
-                                skipped += 1
-
-                                self.log(
-                                    "Skipped unavailable: "
-                                    + str(relative_path)
-                                )
-
-                                continue
-
-                            raise fallback_error
-
-                    copied += 1
-
+                except copy_core.DestinationGone:
                     self.log(
-                        "Copied: "
-                        + str(relative_path)
+                        "Stopped: the destination folder is no longer "
+                        "available. Is the drive still connected?"
                     )
+                    break
 
                 except OSError as error:
-                    if error.errno == errno.ENOENT:
+                    if error.errno == errno.ENOSPC:
+                        failed += 1
+                        self.log("Stopped: the destination drive is full.")
+                        break
+
+                    if copy_core.is_missing_error(error):
                         skipped += 1
-
-                        try:
-                            relative_display = (
-                                source_path.relative_to(
-                                    source
-                                )
-                            )
-                        except ValueError:
-                            relative_display = (
-                                source_path
-                            )
-
                         self.log(
-                            "Skipped unavailable: "
-                            + str(relative_display)
+                            "Skipped unavailable: " + str(item.relative)
                         )
-
                     else:
                         failed += 1
-
                         self.log(
                             "Failed: "
-                            + str(source_path)
+                            + str(item.relative)
                             + " - "
                             + str(error)
                         )
 
-                except Exception as error:
-                    failed += 1
-
-                    self.log(
-                        "Failed: "
-                        + str(source_path)
-                        + " - "
-                        + str(error)
-                    )
-
-            self.finish_copy(
-                copied,
-                skipped,
-                failed,
-            )
+        except copy_core.Cancelled:
+            self.log("Cancelled.")
 
         except Exception as error:
-            self.log(
-                "Fatal error: "
-                + str(error)
-            )
+            failed += 1
+            self.log("Fatal error: " + str(error))
 
-            self.root.after(
-                0,
-                self.start_button.configure,
-                {"state": "normal"},
-            )
-
-            self.copying = False
+        self.finish_copy(copied, skipped, failed)
 
     def finish_copy(
         self,
@@ -675,6 +436,15 @@ class CopyMissingFilesApp:
         )
 
     def on_close(self):
+        if self.copying:
+            if not messagebox.askyesno(
+                "Copy in Progress",
+                "A copy is still running. Stop it and quit?",
+            ):
+                return
+
+            self.cancel_requested = True
+
         self.save_settings()
         self.root.destroy()
 
