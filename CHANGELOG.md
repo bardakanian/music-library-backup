@@ -2,6 +2,11 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 1.3.1 — 2026-11-02
+
+- Fix: the summary said "1 item need attention" instead of "1 item needs attention".
+- Add README with screenshots, MIT license, and sanitized demo screenshots in `assets/screenshots/`.
+
 ## 1.3.0 — 2026-11-02
 
 - Redesigned window: app icon and version badge, Source → Destination folder cards with drop targets, free space and "drive not connected" warnings, and a progress card with size, speed, time left and the current file.

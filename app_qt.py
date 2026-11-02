@@ -41,7 +41,7 @@ from copy_core import format_size
 APP_NAME = "Copy Missing Files"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 CONFIG_DIR = (
     Path.home()
@@ -1146,8 +1146,9 @@ class MainWindow(QMainWindow):
 
         problems = stats["skipped"] + stats["failed"]
         problem_text = (
-            " · " + plural(problems, "item") + " need attention — "
-            "choose Problems below"
+            " · " + plural(problems, "item")
+            + (" needs" if problems == 1 else " need")
+            + " attention — choose Problems below"
             if problems
             else ""
         )
