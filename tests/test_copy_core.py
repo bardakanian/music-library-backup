@@ -1,6 +1,7 @@
 import errno
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -175,6 +176,91 @@ class WorkerTests(FolderTestCase):
         self.assertEqual(stats["skipped"], 1)
         self.assertEqual(stats["failed"], 0)
         self.assertEqual(stats["done_bytes"], stats["total_bytes"])
+
+    def add_album(self, count):
+        for number in range(count):
+            write(self.source / "many" / f"{number}.mp3", "x" * 100)
+
+    def test_copies_run_at_the_same_time(self):
+        self.add_album(8)
+        barrier = threading.Barrier(copy_core.PARALLEL_COPIES, timeout=10)
+        real_copy = copy_core.copy_item
+        first_round = threading.BoundedSemaphore(copy_core.PARALLEL_COPIES)
+
+        def copy_together(*args, **kwargs):
+            if first_round.acquire(blocking=False):
+                barrier.wait()
+            return real_copy(*args, **kwargs)
+
+        with mock.patch.object(copy_core, "copy_item", copy_together):
+            stats = self.run_worker(preview=False)
+
+        self.assertEqual(stats["phase"], "done")
+        self.assertEqual(stats["copied"], 10)
+        self.assertEqual(stats["done_bytes"], stats["total_bytes"])
+        self.assertEqual(partial_files(self.destination), [])
+
+    def test_one_failure_does_not_stop_the_others(self):
+        self.add_album(6)
+        real_copy = copy_core.copy_item
+
+        def fail_one(item, *args, **kwargs):
+            if item.relative.name == "3.mp3":
+                raise OSError(errno.EIO, "Input/output error")
+            return real_copy(item, *args, **kwargs)
+
+        with mock.patch.object(copy_core, "copy_item", fail_one):
+            stats = self.run_worker(preview=False)
+
+        self.assertEqual(stats["phase"], "done")
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["copied"], 7)
+        self.assertEqual(stats["processed"], 8)
+
+    def test_full_drive_stops_remaining_copies(self):
+        self.add_album(50)
+
+        def full(*_args, **_kwargs):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch.object(copy_core, "copy_item", full):
+            stats = self.run_worker(preview=False)
+
+        self.assertEqual(stats["phase"], "stopped")
+        self.assertEqual(stats["message"], "The destination drive is full.")
+        self.assertLessEqual(stats["failed"], copy_core.PARALLEL_COPIES * 2)
+
+    def test_cancel_stops_all_copies_and_removes_partials(self):
+        self.add_album(20)
+        worker = app_qt.CopyWorker(self.source, self.destination, False)
+        results = []
+        worker.finished.connect(results.append)
+        real_copy = copy_core.copy_item
+        calls = []
+
+        def cancel_midway(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 5:
+                worker.cancel()
+            return real_copy(*args, **kwargs)
+
+        with mock.patch.object(copy_core, "copy_item", cancel_midway):
+            worker.run()
+
+        self.assertEqual(results[0]["phase"], "cancelled")
+        self.assertLess(results[0]["processed"], 22)
+        self.assertEqual(partial_files(self.destination), [])
+
+    def test_names_differing_by_case_are_not_copied_at_once(self):
+        items = [
+            copy_core.PlanItem(Path("x"), Path("Song.mp3"), False, 1),
+            copy_core.PlanItem(Path("y"), Path("song.mp3"), False, 1),
+            copy_core.PlanItem(Path("z"), Path("other.mp3"), False, 1),
+        ]
+
+        locks = copy_core.name_clash_locks(items)
+
+        self.assertEqual(list(locks), ["song.mp3"])
 
     def test_not_enough_space_copies_nothing(self):
         with mock.patch.object(copy_core, "free_space", return_value=0):

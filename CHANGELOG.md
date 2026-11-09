@@ -2,6 +2,11 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 1.4.0 — 2026-11-08
+
+- Copy up to 4 files at the same time (PySide6 app). Progress shows the files in flight, and Cancel, a full drive or an unplugged drive stop all of them and remove their partial copies.
+- Names that differ only by case or Unicode form are copied one after the other, so neither can replace the other on drives that ignore case.
+
 ## 1.3.1 — 2026-11-02
 
 - Fix: the summary said "1 item need attention" instead of "1 item needs attention".

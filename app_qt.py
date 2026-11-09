@@ -1,7 +1,10 @@
 import errno
 import json
 import sys
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRectF, QThread, QUrl, Qt, Signal, Slot
@@ -41,7 +44,7 @@ from copy_core import format_size
 APP_NAME = "Copy Missing Files"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 CONFIG_DIR = (
     Path.home()
@@ -266,7 +269,12 @@ class CopyWorker(QObject):
         self.pending_log = []
         self.last_emit = 0.0
         self.copy_started = None
-        self.item_bytes = 0
+
+        # Copy threads only touch done_bytes and active_items, under this
+        # lock. Everything else, including signals, stays on the worker thread.
+        self.copy_lock = threading.Lock()
+        self.active_items = {}
+        self.halted = False
 
         self.stats = {
             "preview": preview,
@@ -318,12 +326,8 @@ class CopyWorker(QObject):
         self.stats["scanned"] = count
         self.emit_progress()
 
-    def on_bytes(self, count):
-        self.stats["done_bytes"] += count
-        self.item_bytes += count
-        self.emit_progress()
-
     def stop(self, message):
+        self.halted = True
         self.stats["phase"] = "stopped"
         self.stats["message"] = message
         self.add_log("error", message)
@@ -418,66 +422,173 @@ class CopyWorker(QObject):
         stats["phase"] = "copying"
         self.copy_started = time.monotonic()
 
-        for item in plan.items:
-            if self.cancel_requested:
+        guards = copy_core.name_clash_locks(plan.items)
+        cancelled = False
+
+        with ThreadPoolExecutor(
+            max_workers=copy_core.PARALLEL_COPIES,
+            thread_name_prefix="copy",
+        ) as pool:
+            upcoming = iter(plan.items)
+            waiting = {}
+
+            # Only a few files are queued at once: wait() scans every
+            # future, which would crawl with a whole library queued.
+            while True:
+                while (
+                    not self.should_stop_copy()
+                    and len(waiting) < copy_core.PARALLEL_COPIES * 2
+                ):
+                    item = next(upcoming, None)
+
+                    if item is None:
+                        break
+
+                    waiting[pool.submit(self.copy_one, item, guards)] = item
+
+                # Once stopped, this still drains what's running so files
+                # that finished in the meantime are counted.
+                if not waiting:
+                    break
+
+                done, _ = wait(
+                    waiting,
+                    timeout=0.1,
+                    return_when=FIRST_COMPLETED,
+                )
+
+                for future in done:
+                    item = waiting.pop(future)
+
+                    try:
+                        copied, item_bytes = future.result()
+                    except copy_core.Cancelled:
+                        cancelled = True
+                    except (copy_core.DestinationGone, OSError) as error:
+                        self.record_failure(item, error, error.item_bytes)
+                    else:
+                        self.record_success(item, copied, item_bytes)
+
+                self.update_current()
+                self.emit_progress()
+
+        if self.cancel_requested and stats["phase"] != "stopped":
+            if cancelled or stats["processed"] < len(plan.items):
                 raise copy_core.Cancelled()
 
-            stats["current"] = str(item.relative)
-            self.item_bytes = 0
+    def should_stop_copy(self):
+        return self.cancel_requested or self.halted
+
+    def copy_one(self, item, guards):
+        """Runs on a copy thread. Returns (copied, bytes written)."""
+        if self.should_stop_copy():
+            raise copy_core.Cancelled()
+
+        item_bytes = 0
+
+        def on_bytes(count):
+            nonlocal item_bytes
+            item_bytes += count
+
+            with self.copy_lock:
+                self.stats["done_bytes"] += count
+
+        guard = guards.get(copy_core.name_key(item.relative), nullcontext())
+
+        with guard:
+            with self.copy_lock:
+                self.active_items[item.relative] = None
 
             try:
-                if copy_core.copy_item(
+                copied = copy_core.copy_item(
                     item,
                     self.destination,
-                    self.on_bytes,
-                    self.is_cancelled,
-                ):
-                    stats["copied"] += 1
-                    stats["copied_bytes"] += item.size
-                    self.add_log("copied", str(item.relative))
-                else:
-                    stats["existing"] += 1
-
-            except copy_core.Cancelled:
-                stats["done_bytes"] -= self.item_bytes
-                raise
-
-            except copy_core.DestinationGone:
-                self.stop(
-                    "The destination folder is no longer available. "
-                    "Is the drive still connected?"
+                    on_bytes,
+                    self.should_stop_copy,
                 )
+            except copy_core.Cancelled:
+                with self.copy_lock:
+                    self.stats["done_bytes"] -= item_bytes
+                raise
+            except (copy_core.DestinationGone, OSError) as error:
+                error.item_bytes = item_bytes
+                raise
+            finally:
+                with self.copy_lock:
+                    del self.active_items[item.relative]
+
+        return copied, item_bytes
+
+    def update_current(self):
+        with self.copy_lock:
+            active = list(self.active_items)
+
+        if not active:
+            return
+
+        current = str(active[0])
+
+        if len(active) > 1:
+            current += f"  (+{len(active) - 1} more)"
+
+        self.stats["current"] = current
+
+    def finish_item(self, item, item_bytes):
+        with self.copy_lock:
+            self.stats["done_bytes"] += item.size - item_bytes
+
+        self.stats["processed"] += 1
+
+    def record_success(self, item, copied, item_bytes):
+        stats = self.stats
+
+        if copied:
+            stats["copied"] += 1
+            stats["copied_bytes"] += item.size
+            self.add_log("copied", str(item.relative))
+        else:
+            stats["existing"] += 1
+
+        self.finish_item(item, item_bytes)
+
+    def stop_once(self, message):
+        if self.stats["phase"] != "stopped":
+            self.stop(message)
+
+    def record_failure(self, item, error, item_bytes):
+        stats = self.stats
+        gone = (
+            "The destination folder is no longer available. "
+            "Is the drive still connected?"
+        )
+
+        if isinstance(error, copy_core.DestinationGone):
+            self.stop_once(gone)
+            return
+
+        if error.errno == errno.ENOSPC:
+            stats["failed"] += 1
+            self.stop_once("The destination drive is full.")
+            return
+
+        if copy_core.is_missing_error(error):
+            if not self.destination.is_dir():
+                self.stop_once(gone)
                 return
 
-            except OSError as error:
-                if error.errno == errno.ENOSPC:
-                    stats["failed"] += 1
-                    self.stop("The destination drive is full.")
-                    return
+            stats["skipped"] += 1
+            self.add_log(
+                "skipped",
+                str(item.relative) + " — no longer available",
+            )
+        else:
+            stats["failed"] += 1
+            self.add_log(
+                "error",
+                str(item.relative) + " — " + (error.strerror or str(error)),
+            )
 
-                if copy_core.is_missing_error(error):
-                    if not self.destination.is_dir():
-                        self.stop(
-                            "The destination folder is no longer "
-                            "available. Is the drive still connected?"
-                        )
-                        return
-
-                    stats["skipped"] += 1
-                    self.add_log(
-                        "skipped",
-                        str(item.relative) + " — no longer available",
-                    )
-                else:
-                    stats["failed"] += 1
-                    self.add_log(
-                        "error",
-                        str(item.relative) + " — " + (error.strerror or str(error)),
-                    )
-
-            stats["done_bytes"] += item.size - self.item_bytes
-            stats["processed"] += 1
-            self.emit_progress()
+        self.finish_item(item, item_bytes)
 
 
 class ElidedLabel(QLabel):

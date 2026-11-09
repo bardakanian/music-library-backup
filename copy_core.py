@@ -8,6 +8,9 @@ import hashlib
 import os
 import shutil
 import stat
+import threading
+import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -20,6 +23,8 @@ PARTIAL_PREFIX = ".cmf-partial-"
 CHUNK_SIZE = 4 * 1024 * 1024
 
 MAX_NAME_BYTES = 255
+
+PARALLEL_COPIES = 4
 
 
 class Cancelled(Exception):
@@ -300,6 +305,21 @@ def ensure_parent(destination_root, relative):
             raise DestinationGone(str(destination_root)) from error
 
     return folder
+
+
+def name_key(relative):
+    return unicodedata.normalize("NFC", str(relative)).casefold()
+
+
+def name_clash_locks(items):
+    """Return a lock for each destination name shared by several items.
+
+    exFAT and default APFS ignore case, so "Song.mp3" and "song.mp3" from a
+    case-sensitive source land on the same file. Copied at the same time,
+    both would pass the exists check and one would replace the other.
+    """
+    counts = Counter(name_key(item.relative) for item in items)
+    return {key: threading.Lock() for key, count in counts.items() if count > 1}
 
 
 def copy_item(item, destination_root, on_bytes=None, should_cancel=None):
