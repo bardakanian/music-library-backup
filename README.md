@@ -51,9 +51,10 @@ app imports the stick into your music folder and adds the playlists to MusicBee.
 
 ## Screenshots
 
-The screenshots below were captured from a disposable demo library containing
-fictional artist names, album names, and filenames. They contain no personal
-files or real library paths.
+The screenshots below show the Mac backup, and the Windows import has its own
+under [Importing on Windows](#importing-on-windows). All were captured from a
+disposable demo library containing fictional artist names, album names, and
+filenames. They contain no personal files or real library paths.
 
 ![Preview listing missing files from a fictional demo library](assets/screenshots/preview.png)
 
@@ -95,6 +96,8 @@ What doesn't carry over:
 On Windows the app opens in **Import to this computer** mode. (On a Mac, switch to it
 with the menu at the top right.)
 
+![Animated demo: previewing, then importing a demo library from a stick on Windows](assets/windows-import.gif)
+
 1. Plug in the stick. The app looks for a drive that holds a Music Library Backup and
    fills in the source. Use **Find USB stick** to look again, or **Choose…** to pick
    the stick's Music folder yourself. If the stick comes back under another drive
@@ -122,6 +125,15 @@ To make MusicBee pick up the music itself, add the import folder under **Prefere
 the app can't start a scan for you.
 
 Ratings and play counts don't carry over: MusicBee can't read Apple's database.
+
+These screenshots show the Windows import window, captured from the same kind of
+disposable demo library (fictional names, a stick on `E:` and a PC folder on `P:`).
+
+![Windows import preview listing what's missing on the PC](assets/screenshots/windows-preview.png)
+
+![Windows import in progress with size, speed and time left](assets/screenshots/windows-copying.png)
+
+![Finished Windows import with the playlists added to MusicBee](assets/screenshots/windows-finished.png)
 
 ## Restoring Apple Music from a backup
 
