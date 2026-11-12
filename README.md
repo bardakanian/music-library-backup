@@ -7,7 +7,8 @@ deleting what's already there.
 Music Library Backup compares your music folder with a backup folder, shows you
 exactly what's missing, and copies only those files. It can also save a dated copy
 of the library database and export your playlists as `.m3u8` files. It's built
-with Python and PySide6 and runs entirely on your Mac.
+with Python and PySide6. The backup runs on your Mac; on the Windows PC the same
+app imports the stick into your music folder and adds the playlists to MusicBee.
 
 > Formerly **Copy Missing Files**. Your saved folders carry over automatically.
 
@@ -36,7 +37,11 @@ with Python and PySide6 and runs entirely on your Mac.
   place only when complete.
 - Detects an unplugged drive, both before starting and mid-copy, checks free
   space first, and stops cleanly if the drive fills up.
-- **Eject** the stick from the app when the backup is done.
+- **Import to this computer** (the Windows side): copies the music from the stick onto
+  the PC, adding only what's missing. It finds the stick for you, and
+  **Add playlists to MusicBee** puts the playlists into MusicBee with full paths.
+- **Eject** the stick from the app when the backup or import is done, on Mac and
+  Windows.
 - Warns before copying your library a second time when the music folder and the
   destination are one folder level apart, and offers to switch to the matching folder.
 - **Cancel** stops right away, even in the middle of a large file, and removes the
@@ -69,10 +74,11 @@ files or real library paths.
    playlists can be read. You can change this later in System Settings → Privacy &
    Security → Automation.
 5. Click **Eject** and unplug the stick.
-6. On Windows, in MusicBee: **File → Scan Folders for New Files**, and choose the
-   `Music` folder on the stick (or copy it to the PC first). Then import the
-   `.m3u8` files from `Library Backups\<latest date>\Playlists`, for example by
-   dragging them onto MusicBee's Playlists panel.
+6. On the Windows PC, follow [Importing on Windows](#importing-on-windows) below.
+   You can also do it by hand: in MusicBee, **File → Scan Folders for New Files**,
+   choose the `Music` folder on the stick (or copy it to the PC first), then drag
+   the `.m3u8` files from `Library Backups\<latest date>\Playlists` onto MusicBee's
+   Playlists panel.
 
 What doesn't carry over:
 
@@ -83,6 +89,39 @@ What doesn't carry over:
   copied. Download them in Apple Music first.
 - Ratings and play counts live in the library database. MusicBee can't read
   Apple's database; the backup copy is for restoring Apple Music on a Mac.
+
+## Importing on Windows
+
+On Windows the app opens in **Import to this computer** mode. (On a Mac, switch to it
+with the menu at the top right.)
+
+1. Plug in the stick. The app looks for a drive that holds a Music Library Backup and
+   fills in the source. Use **Find USB stick** to look again, or **Choose…** to pick
+   the stick's Music folder yourself. If the stick comes back under another drive
+   letter, the app finds it again.
+2. Choose where the music should go on the PC. The default is
+   `Music\Apple Music Library`.
+3. Click **Preview** to see what would be copied, then **Import**. Only files that
+   are missing are copied; nothing is overwritten or deleted. `Library Backups`
+   (the database copy and playlists) comes along as it is.
+4. **Add playlists to MusicBee** (on by default) then copies the newest backup's
+   playlists into `Music\MusicBee\Playlists`, with full paths, because the relative
+   paths in the backup stop working once a file is moved.
+5. Click **Eject** and unplug the stick.
+
+How playlists are kept up to date: a playlist the app wrote earlier is updated on
+the next import, so edits made on the Mac come through, but only while it is
+unchanged in MusicBee. A playlist you have edited there, or made yourself, is never
+touched, and the log says so. Tracks that aren't on the PC are left out. To get the
+Mac version of one you edited, delete it in MusicBee and import again. Nothing is
+ever deleted, so a renamed playlist arrives as a new one. If new playlists don't
+show up, restart MusicBee.
+
+To make MusicBee pick up the music itself, add the import folder under **Preferences
+→ Library** as a monitored folder. MusicBee has no command to scan from outside, so
+the app can't start a scan for you.
+
+Ratings and play counts don't carry over: MusicBee can't read Apple's database.
 
 ## Restoring Apple Music from a backup
 
@@ -111,7 +150,7 @@ which case it's reported). Empty folders aren't copied.
 
 ## Requirements
 
-- macOS 11 or later
+- macOS 11 or later for the backup, Windows 10 or 11 for the import
 - Python 3.10 or newer
 - [PySide6](https://doc.qt.io/qtforpython-6/), the only dependency
 
@@ -135,6 +174,12 @@ python3 -m venv .venv
 Alternatively, double-click **Music Library Backup.command** in Finder. On first
 run it creates `.venv`, installs PySide6, and starts the app. If macOS blocks it,
 right-click the file and choose **Open**.
+
+On Windows, double-click **Music Library Backup.bat** instead. On first run it creates
+`.venv`, installs PySide6, and starts the app. Then run
+`.venv\Scripts\python.exe make_launcher_windows.py` to put a **Music Library Backup**
+shortcut on your desktop. It starts the project's latest code, so run the script again
+if you move the folder.
 
 ### 3. Launch the app
 
@@ -165,14 +210,20 @@ the Music app on your Mac for them, which macOS lets you allow or deny.
 The only data it stores is the last-used folders and options, in:
 
 ```text
-~/Library/Application Support/Music Library Backup/settings.json
+~/Library/Application Support/Music Library Backup/settings.json   (macOS)
+%APPDATA%\Music Library Backup\settings.json                       (Windows)
 ```
 
-This file contains absolute paths on your computer. Don't publish or commit it.
+This file contains absolute paths on your computer. Don't publish or commit it. On
+Windows the same folder also holds `musicbee_playlists.json`, a list of fingerprints
+of the playlist files the app has written into MusicBee, used to tell your edits from
+its own.
 
 The app only reads from the music folder and the library database. In the
-destination it only creates new folders and files, plus a short-lived hidden
-temporary file (`.cmf-partial-…`) for the item being copied.
+destination it only creates new folders and files, plus a short-lived temporary
+file (`.cmf-partial-<name>.part`, hidden on Windows) for the item being copied. On
+Windows it also writes playlist files into MusicBee's Playlists folder, and only
+ever replaces ones it wrote itself and you haven't changed.
 
 ## Project structure
 
@@ -182,7 +233,9 @@ copy_core.py                   Logic with no GUI: planning, Windows-safe names, 
                                library backup and playlist export
 main.py                        Original Tkinter version (file copy only)
 make_launcher.py               Builds and installs Music Library Backup.app
-Music Library Backup.command   Double-click launcher that also sets up .venv
+make_launcher_windows.py       Creates the Windows desktop shortcut
+Music Library Backup.command   Double-click launcher (macOS) that also sets up .venv
+Music Library Backup.bat       Double-click launcher (Windows) that also sets up .venv
 CHANGELOG.md                   Version history (the version itself is VERSION in app_qt.py)
 tests/                         Copy logic, music backup, worker, version and launcher tests
 assets/screenshots/            Sanitized documentation screenshots
@@ -225,8 +278,17 @@ test checks that they match.
 - **The stick has `._` files from older versions:** the app now removes the ones
   it creates, but copies made before 2.0.1 left one beside every file. Run
   `dot_clean -m /Volumes/<stick name>` in Terminal to remove them.
-- **Eject fails:** close any Finder window or app that's using the stick, then try
-  again.
+- **Eject fails:** close any Finder or Explorer window or app that's using the stick,
+  then try again. On Windows the app reports success only once the drive has gone.
+- **Windows: "Folder not found. Is the USB stick plugged in?":** plug the stick in
+  and switch back to the app, or click **Find USB stick**.
+- **Windows: playlists are missing in MusicBee:** the app only adds them if
+  `Music\MusicBee\Playlists` exists, so open MusicBee once first. Then restart
+  MusicBee after an import.
+- **Windows: a copy fails on a very long path:** turn on long path support in Windows,
+  or import to a shorter folder such as `D:\Music`.
+- **Windows: the stick is on a USB hard drive:** if Eject says it may still be in use,
+  use the Windows "Safely Remove Hardware" icon instead.
 
 ## Project status
 

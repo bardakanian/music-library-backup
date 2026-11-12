@@ -2,6 +2,16 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 2.2.0 — 2026-11-12
+
+- New **Import to this computer** mode for the Windows side. It copies the music from a Music Library Backup stick onto the PC, adding only what's missing and never overwriting. **Library Backups** (the database copy and the `.m3u8` playlists) comes along as it is. On Windows the app opens in this mode; on a Mac, switch with the menu in the header.
+- **Find USB stick** looks for a drive that holds a backup and fills in the source. It also runs on its own the first time, when exactly one drive qualifies.
+- New **Add playlists to MusicBee** option (on by default): after an import, the newest backup's `.m3u8` playlists are copied into `~\Music\MusicBee\Playlists` with full paths, since the relative paths in the backup stop working once a file is moved. A playlist the app wrote earlier is updated on the next import, so edits made on the Mac come through, but only while it's unchanged in MusicBee. One you've edited there, or made yourself, is never touched (the log says so). Tracks not found on the PC are left out. What the app wrote is remembered in `musicbee_playlists.json` in the settings folder.
+- **Eject** now works on Windows too. In an import it ejects the USB stick, which the app only reports as ejected once the drive has actually gone. It's never offered for the system drive.
+- The stick is found again if it comes back under another drive letter.
+- Files being copied are written under `.cmf-partial-<name>.part`, which is also hidden on Windows, so a player watching the folder (MusicBee's monitoring) doesn't import half-copied files.
+- The app now runs on Windows: settings are kept in `%APPDATA%\Music Library Backup`, and `Music Library Backup.bat` sets up `.venv` and starts it.
+
 ## 2.1.1 — 2026-11-11
 
 - The GitHub repository is now `bardakanian/music-library-backup` (renamed from `copy-missing-files`; old links redirect). README clone instructions updated.

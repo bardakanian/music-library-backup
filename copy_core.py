@@ -22,6 +22,10 @@ from pathlib import Path
 # would mistake for one that is already there.
 PARTIAL_PREFIX = ".cmf-partial-"
 
+# Added to the end too, so that a player watching the folder (MusicBee on
+# Windows doesn't treat a leading dot as hidden) doesn't take it for music.
+PARTIAL_SUFFIX = ".part"
+
 CHUNK_SIZE = 4 * 1024 * 1024
 
 MAX_NAME_BYTES = 255
@@ -446,15 +450,31 @@ def build_plan(
 
 
 def partial_path(destination):
-    name = PARTIAL_PREFIX + destination.name
+    name = PARTIAL_PREFIX + destination.name + PARTIAL_SUFFIX
 
     if len(name.encode("utf-8", "surrogateescape")) > MAX_NAME_BYTES:
         digest = hashlib.sha1(
             destination.name.encode("utf-8", "surrogateescape")
         ).hexdigest()
-        name = PARTIAL_PREFIX + digest
+        name = PARTIAL_PREFIX + digest + PARTIAL_SUFFIX
 
     return destination.with_name(name)
+
+
+def hide_file(path):
+    """Mark a file hidden on Windows, where a leading dot doesn't do it."""
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        FILE_ATTRIBUTE_HIDDEN = 0x2
+        ctypes.windll.kernel32.SetFileAttributesW(
+            str(path), FILE_ATTRIBUTE_HIDDEN
+        )
+    except (OSError, AttributeError):
+        pass
 
 
 def ensure_parent(destination_root, relative):
@@ -516,6 +536,8 @@ def copy_item(item, destination_root, on_bytes=None, should_cancel=None):
 
     try:
         with open(item.source, "rb") as reader, open(temporary, "wb") as writer:
+            hide_file(temporary)
+
             while True:
                 if should_cancel is not None and should_cancel():
                     raise Cancelled()
@@ -854,6 +876,39 @@ def write_playlists(
     return written, tracks_written, left_out
 
 
+def windows_drive_of(path):
+    """Return E:\\ for a path on a drive other than the system drive."""
+    if os.name != "nt":
+        return None
+
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    system = os.environ.get("SystemDrive", "C:").rstrip("\\/").upper()
+
+    if len(drive) != 2 or drive[1] != ":" or drive.upper() == system:
+        return None
+
+    return Path(drive + "\\")
+
+
+def ejectable_drive(path):
+    """The external drive a path is on, or None if it isn't on one."""
+    path = path or ""
+
+    if not path.strip():
+        return None
+
+    drive = windows_drive_of(path)
+
+    if drive is not None:
+        return drive if drive.exists() else None
+
+    return volume_of(path)
+
+
+def drive_label(volume):
+    return volume.name or str(volume).rstrip("\\/")
+
+
 def volume_of(path):
     """Return /Volumes/<name> for a path on an external drive, else None."""
     parts = Path(os.path.abspath(path)).parts
@@ -979,3 +1034,228 @@ def better_folder_match(source, destination):
         )
 
     return {"role": role, "path": str(folder), "message": message}
+
+
+def list_drive_roots():
+    """Return the root folders of the drives that are plugged in.
+
+    On Windows that is every drive letter except the system drive; elsewhere
+    it is each volume under /Volumes (macOS) or /media and /mnt (Linux).
+    """
+    if os.name == "nt":
+        import string
+
+        system = os.environ.get("SystemDrive", "C:").rstrip("\\/").upper()
+        roots = []
+
+        for letter in string.ascii_uppercase:
+            if letter + ":" == system:
+                continue
+
+            root = Path(letter + ":\\")
+
+            try:
+                if root.exists():
+                    roots.append(root)
+            except OSError:
+                continue
+
+        return roots
+
+    roots = []
+
+    for base in ("/Volumes", "/media", "/mnt"):
+        try:
+            roots.extend(
+                Path(entry.path) for entry in os.scandir(base)
+                if entry.is_dir() and not entry.is_symlink()
+            )
+        except OSError:
+            continue
+
+    return roots
+
+
+def find_backup_folder(root):
+    """Find the music folder a Music Library Backup left on a drive.
+
+    The backup folder is the one that holds "Library Backups". Failing that,
+    a folder named "Music" on the drive is used. Returns None if neither exists.
+    """
+    root = Path(root)
+
+    try:
+        if (root / BACKUPS_FOLDER).is_dir():
+            return root
+
+        children = sorted(
+            (
+                Path(entry.path) for entry in os.scandir(root)
+                if entry.is_dir(follow_symlinks=False) and not is_junk(entry.name)
+            ),
+            key=lambda path: path.name.casefold(),
+        )
+    except OSError:
+        return None
+
+    for child in children:
+        try:
+            if (child / BACKUPS_FOLDER).is_dir():
+                return child
+        except OSError:
+            continue
+
+    for child in children:
+        if child.name.casefold() == "music":
+            return child
+
+    return None
+
+
+def find_backup_drives(roots=None):
+    """Return [(drive root, backup folder)] for drives holding a backup."""
+    found = []
+
+    for root in (list_drive_roots() if roots is None else roots):
+        folder = find_backup_folder(root)
+
+        if folder is not None:
+            found.append((Path(root), folder))
+
+    return found
+
+
+def latest_playlists_folder(root):
+    """Return the Playlists folder of the newest library backup, or None."""
+    backups = Path(root) / BACKUPS_FOLDER
+
+    try:
+        folders = sorted(
+            (entry for entry in backups.iterdir() if entry.is_dir()),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+    except OSError:
+        return None
+
+    for folder in folders:
+        playlists = folder / PLAYLISTS_FOLDER
+
+        if playlists.is_dir():
+            return playlists
+
+    return None
+
+
+def default_import_folder():
+    """Where music is imported to on this computer by default."""
+    return Path.home() / "Music" / "Apple Music Library"
+
+
+def musicbee_playlists_folder():
+    """MusicBee's own Playlists folder, if MusicBee has been set up here."""
+    folder = Path.home() / "Music" / "MusicBee" / "Playlists"
+    return folder if folder.is_dir() else None
+
+
+def load_playlist_state(state_file):
+    """Read {playlist name: fingerprint of what this app last wrote}."""
+    try:
+        with open(state_file, encoding="utf-8") as file:
+            state = json.load(file)
+    except (OSError, ValueError):
+        return {}
+
+    return state if isinstance(state, dict) else {}
+
+
+def save_playlist_state(state_file, state):
+    state_file = Path(state_file)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(state_file, "w", encoding="utf-8") as file:
+        json.dump(state, file, indent=2)
+
+
+def fingerprint(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def add_playlists_to_musicbee(playlists_folder, target_folder, state_file=None):
+    """Copy .m3u8 playlists into MusicBee's Playlists folder.
+
+    The backup writes playlists with paths relative to their own folder,
+    which stop working once a file is moved, so the copies get full paths.
+    Tracks that aren't on this computer are left out.
+
+    A playlist this app wrote earlier is updated, but only while it still
+    matches what was written; one you've since edited in MusicBee, or made
+    yourself, is never touched. state_file remembers what was written.
+    Returns a dict of counts: written, updated, unchanged, kept_edited,
+    kept_other, tracks and left_out.
+    """
+    playlists_folder = Path(playlists_folder)
+    target_folder = Path(target_folder)
+    state = load_playlist_state(state_file) if state_file else {}
+    mine = state.setdefault(str(target_folder).casefold(), {})
+    counts = dict(
+        written=0, updated=0, unchanged=0, kept_edited=0, kept_other=0,
+        tracks=0, left_out=0,
+    )
+
+    for playlist in sorted(playlists_folder.glob("*.m3u8")):
+        target = target_folder / playlist.name
+        key = playlist.name.casefold()
+        lines = ["#EXTM3U"]
+        tracks = left_out = 0
+
+        with open(playlist, encoding="utf-8-sig") as file:
+            entries = [line.strip() for line in file]
+
+        for entry in entries:
+            if not entry or entry.startswith("#"):
+                continue
+
+            track = Path(os.path.normpath(
+                playlists_folder / entry.replace("\\", os.sep).replace("/", os.sep)
+            ))
+
+            if track.is_file():
+                lines.append(str(track))
+                tracks += 1
+            else:
+                left_out += 1
+
+        data = ("\r\n".join(lines) + "\r\n").encode("utf-8")
+        new_print = fingerprint(data)
+        outcome = "written"
+
+        if target.exists():
+            current = fingerprint(target.read_bytes())
+
+            if key not in mine:
+                outcome = "kept_other"
+            elif current == new_print:
+                outcome = "unchanged"
+            elif current == mine[key]:
+                outcome = "updated"
+            else:
+                outcome = "kept_edited"
+
+        if outcome in ("written", "updated"):
+            target_folder.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            mine[key] = new_print
+        elif outcome == "unchanged":
+            mine[key] = new_print
+
+        counts[outcome] += 1
+
+        if outcome in ("written", "updated", "unchanged"):
+            counts["tracks"] += tracks
+            counts["left_out"] += left_out
+
+    if state_file:
+        save_playlist_state(state_file, state)
+
+    return counts

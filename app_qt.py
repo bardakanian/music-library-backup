@@ -1,5 +1,6 @@
 import errno
 import json
+import os
 import sys
 import threading
 import time
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -56,16 +58,29 @@ from copy_core import format_size
 APP_NAME = "Music Library Backup"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "2.1.1"
+VERSION = "2.2.0"
 
-CONFIG_DIR = (
-    Path.home()
-    / "Library"
-    / "Application Support"
-    / APP_NAME
-)
+IS_WINDOWS = sys.platform == "win32"
+
+
+def settings_base():
+    if IS_WINDOWS:
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support"
+
+    return Path.home() / ".config"
+
+
+CONFIG_DIR = settings_base() / APP_NAME
 
 CONFIG_FILE = CONFIG_DIR / "settings.json"
+
+# The two things the app does. Backup runs on a Mac; import runs on the PC
+# that receives the stick.
+MODE_BACKUP = "backup"
+MODE_IMPORT = "import"
 
 # Settings saved before the app was renamed from Copy Missing Files.
 OLD_CONFIG_FILE = (
@@ -863,9 +878,9 @@ class FolderCard(QFrame):
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(8)
 
-        role_label = QLabel(role.upper())
-        role_label.setObjectName("role")
-        layout.addWidget(role_label)
+        self.role_label = QLabel(role.upper())
+        self.role_label.setObjectName("role")
+        layout.addWidget(self.role_label)
 
         row = QHBoxLayout()
         row.setSpacing(10)
@@ -909,6 +924,10 @@ class FolderCard(QFrame):
     def set_text(self, path):
         self.path = path.strip()
         self.refresh()
+
+    def set_role(self, role, dialog_title):
+        self.role_label.setText(role.upper())
+        self.dialog_title = dialog_title
 
     def set_locked(self, locked):
         self.choose_button.setEnabled(not locked)
@@ -1017,8 +1036,13 @@ class MainWindow(QMainWindow):
         self.eject_process = None
         self.pending_mismatch = None
 
+        # Windows can only import; a Mac can do both.
+        self.mode = MODE_IMPORT if IS_WINDOWS else MODE_BACKUP
+        self.folders = {MODE_BACKUP: ["", ""], MODE_IMPORT: ["", ""]}
+
         self.build_gui()
         self.load_settings()
+        self.apply_mode(self.mode, capture=False)
 
     def build_gui(self):
         central = QWidget()
@@ -1064,16 +1088,19 @@ class MainWindow(QMainWindow):
         title.setObjectName("title")
         text.addWidget(title)
 
-        subtitle = QLabel(
-            "Copies your Apple Music library to a USB stick or backup drive. "
-            "It only adds what's missing; nothing there is ever overwritten "
-            "or deleted."
-        )
-        subtitle.setWordWrap(True)
-        subtitle.setObjectName("muted")
-        text.addWidget(subtitle)
+        self.subtitle = QLabel()
+        self.subtitle.setWordWrap(True)
+        self.subtitle.setObjectName("muted")
+        text.addWidget(self.subtitle)
 
         header.addLayout(text, 1)
+
+        if not IS_WINDOWS:
+            self.mode_box = QComboBox()
+            self.mode_box.addItem("Back up this Mac", MODE_BACKUP)
+            self.mode_box.addItem("Import to this computer", MODE_IMPORT)
+            self.mode_box.currentIndexChanged.connect(self.on_mode_chosen)
+            header.addWidget(self.mode_box, 0, Qt.AlignTop)
 
         version = QLabel("v" + VERSION)
         version.setObjectName("versionPill")
@@ -1133,7 +1160,19 @@ class MainWindow(QMainWindow):
             "and other Windows players can import."
         )
 
-        for box in (self.windows_box, self.database_box, self.playlists_box):
+        self.musicbee_box = QCheckBox("Add playlists to MusicBee")
+        self.musicbee_box.setToolTip(
+            "After the import, copies the playlists into MusicBee's Playlists\n"
+            "folder with full paths. Playlists MusicBee already has are kept."
+        )
+        row.addWidget(self.musicbee_box)
+
+        for box in (
+            self.windows_box,
+            self.database_box,
+            self.playlists_box,
+            self.musicbee_box,
+        ):
             box.setChecked(True)
             box.toggled.connect(lambda _checked: self.save_settings())
             row.addWidget(box)
@@ -1147,15 +1186,23 @@ class MainWindow(QMainWindow):
         self.music_button.clicked.connect(self.use_music_library)
         row.addWidget(self.music_button)
 
+        self.detect_button = QPushButton("Find USB stick")
+        self.detect_button.setToolTip(
+            "Look for a drive that holds a Music Library Backup and use it\n"
+            "as the source."
+        )
+        self.detect_button.clicked.connect(self.find_stick)
+        row.addWidget(self.detect_button)
+
         return row
 
     def build_actions(self):
         row = QHBoxLayout()
         row.setSpacing(10)
 
-        hint = QLabel("Tip: Preview shows what's missing without copying.")
-        hint.setObjectName("muted")
-        row.addWidget(hint, 1)
+        self.hint = QLabel()
+        self.hint.setObjectName("muted")
+        row.addWidget(self.hint, 1)
 
         self.eject_button = QPushButton("Eject")
         self.eject_button.clicked.connect(self.eject_destination)
@@ -1266,7 +1313,9 @@ class MainWindow(QMainWindow):
         copy_log_button.clicked.connect(self.copy_log)
         row.addWidget(copy_log_button)
 
-        self.reveal_button = QPushButton("Show in Finder")
+        self.reveal_button = QPushButton(
+            "Show in Explorer" if IS_WINDOWS else "Show in Finder"
+        )
         self.reveal_button.clicked.connect(self.reveal_destination)
         row.addWidget(self.reveal_button)
 
@@ -1279,9 +1328,132 @@ class MainWindow(QMainWindow):
             return "Drive \"" + volume.name + "\" is not connected", True
 
         if not Path(path).is_dir():
+            if self.mode == MODE_IMPORT:
+                return "Folder not found. Is the USB stick plugged in?", True
+
             return "Folder not found", True
 
+        if self.mode == MODE_IMPORT:
+            if (Path(path) / copy_core.BACKUPS_FOLDER).is_dir():
+                return "Music Library Backup found", False
+
+            return "No Library Backups folder here (music only)", False
+
         return "", False
+
+    def on_mode_chosen(self):
+        mode = self.mode_box.currentData()
+
+        if mode == self.mode or self.thread is not None:
+            return
+
+        self.apply_mode(mode)
+
+    def apply_mode(self, mode, capture=True):
+        """Switch between backing up this Mac and importing onto this PC."""
+        if capture:
+            self.folders[self.mode] = [
+                self.source_field.text(),
+                self.destination_field.text(),
+            ]
+
+        self.mode = mode
+        backup = mode == MODE_BACKUP
+
+        if not IS_WINDOWS:
+            self.mode_box.blockSignals(True)
+            self.mode_box.setCurrentIndex(self.mode_box.findData(mode))
+            self.mode_box.blockSignals(False)
+
+        source, destination = self.folders[mode]
+
+        if backup:
+            self.source_field.set_role("Music folder", "Select Music Folder")
+            self.destination_field.set_role(
+                "Backup / USB stick", "Select Destination Folder"
+            )
+            self.subtitle.setText(
+                "Copies your Apple Music library to a USB stick or backup "
+                "drive. It only adds what's missing; nothing there is ever "
+                "overwritten or deleted."
+            )
+            self.start_button.setText("Back Up")
+            self.hint.setText("Tip: Preview shows what's missing without copying.")
+        else:
+            self.source_field.set_role("USB stick", "Select the Music Folder on the Stick")
+            self.destination_field.set_role(
+                "This computer", "Select Folder for the Music"
+            )
+            self.subtitle.setText(
+                "Copies the music from a Music Library Backup stick onto this "
+                "computer, ready for MusicBee. It only adds what's missing; "
+                "nothing is ever overwritten or deleted."
+            )
+            self.start_button.setText("Import")
+            self.hint.setText(
+                "Tip: Preview shows what would be copied without copying."
+            )
+
+            if not destination:
+                destination = str(copy_core.default_import_folder())
+
+            if not source or not Path(source).is_dir():
+                source = self.detected_stick() or source
+
+        self.source_field.set_text(source)
+        self.destination_field.set_text(destination)
+
+        for widget in (
+            self.windows_box,
+            self.database_box,
+            self.playlists_box,
+            self.music_button,
+        ):
+            widget.setVisible(backup)
+
+        self.detect_button.setVisible(not backup)
+        self.musicbee_box.setVisible(not backup)
+        self.show_idle()
+        self.update_options()
+
+    def detected_stick(self):
+        """The backup folder on the one drive that has one, else None."""
+        drives = copy_core.find_backup_drives()
+        return str(drives[0][1]) if len(drives) == 1 else None
+
+    def find_stick(self):
+        drives = copy_core.find_backup_drives()
+
+        if not drives:
+            QMessageBox.information(
+                self,
+                "No USB Stick Found",
+                "Couldn't find a drive with a Music Library Backup on it.\n\n"
+                "Plug in the stick the Mac app made, wait a moment, and try "
+                "again. Or use Choose… to pick its Music folder yourself.",
+            )
+            return
+
+        if len(drives) == 1:
+            choice = drives[0][1]
+        else:
+            names = [str(folder) for _root, folder in drives]
+            picked, accepted = QInputDialog.getItem(
+                self,
+                "Choose the USB Stick",
+                "More than one drive has a backup:",
+                names,
+                0,
+                False,
+            )
+
+            if not accepted:
+                return
+
+            choice = Path(picked)
+
+        self.source_field.set_text(str(choice))
+        self.on_folders_changed()
 
     def describe_destination(self, path):
         volume = copy_core.unmounted_volume(path)
@@ -1305,6 +1477,18 @@ class MainWindow(QMainWindow):
         # Drives come and go while the window is open, so recheck them
         # whenever the window is brought back to the front.
         if event.type() == event.Type.ActivationChange and self.isActiveWindow():
+            # A stick can come back under another drive letter.
+            if (
+                self.mode == MODE_IMPORT
+                and self.thread is None
+                and not Path(self.source_field.text() or ".").is_dir()
+            ):
+                found = self.detected_stick()
+
+                if found:
+                    self.source_field.set_text(found)
+                    self.save_settings()
+
             self.source_field.refresh()
             self.destination_field.refresh()
             self.update_options()
@@ -1316,7 +1500,19 @@ class MainWindow(QMainWindow):
         self.show_idle()
         self.update_options()
 
+    def eject_target(self):
+        """The drive to eject: the stick in an import, else the backup drive."""
+        field = (
+            self.source_field if self.mode == MODE_IMPORT
+            else self.destination_field
+        )
+        return copy_core.ejectable_drive(field.text())
+
     def update_options(self):
+        if self.mode == MODE_IMPORT:
+            self.update_eject_button()
+            return
+
         library = copy_core.find_music_library(self.source_field.text())
 
         if library is None:
@@ -1326,11 +1522,16 @@ class MainWindow(QMainWindow):
 
         self.database_box.setEnabled(library is not None and self.thread is None)
 
-        volume = copy_core.volume_of(self.destination_field.text() or "/")
+        self.update_eject_button()
+
+    def update_eject_button(self):
+        volume = self.eject_target()
         self.eject_button.setVisible(volume is not None and self.thread is None)
 
         if volume is not None:
-            self.eject_button.setText("Eject “" + volume.name + "”")
+            self.eject_button.setText(
+                "Eject “" + copy_core.drive_label(volume) + "”"
+            )
 
     def use_music_library(self):
         media = copy_core.default_media_folder()
@@ -1350,37 +1551,61 @@ class MainWindow(QMainWindow):
         self.on_folders_changed()
 
     def eject_destination(self):
-        volume = copy_core.volume_of(self.destination_field.text() or "/")
+        volume = self.eject_target()
 
         if volume is None or self.eject_process is not None:
             return
 
+        label = copy_core.drive_label(volume)
         self.eject_button.setEnabled(False)
-        self.append_log([("info", "Ejecting " + volume.name + " …")])
+        self.append_log([("info", "Ejecting " + label + " …")])
 
-        # diskutil can take a few seconds; QProcess keeps the window responsive.
+        # Ejecting can take a few seconds; QProcess keeps the window responsive.
         process = QProcess(self)
         process.finished.connect(
             lambda code, _status: self.eject_finished(process, volume, code)
         )
         self.eject_process = process
-        process.start("diskutil", ["eject", str(volume)])
+
+        if IS_WINDOWS:
+            letter = str(volume).rstrip("\\/")
+            process.start("powershell", [
+                "-NoProfile", "-Command",
+                "(New-Object -ComObject Shell.Application)"
+                ".Namespace(17).ParseName('" + letter + "').InvokeVerb('Eject')",
+            ])
+        else:
+            process.start("diskutil", ["eject", str(volume)])
 
     def eject_finished(self, process, volume, code):
         output = bytes(process.readAllStandardError()).decode(errors="replace")
         self.eject_process = None
         process.deleteLater()
+
+        if IS_WINDOWS and code == 0:
+            # Windows ejects in the background and reports nothing, so check
+            # whether the drive has gone.
+            QTimer.singleShot(
+                2500, lambda: self.finish_eject(volume, not volume.exists(), "")
+            )
+            return
+
+        self.finish_eject(volume, code == 0, output)
+
+    def finish_eject(self, volume, ok, output):
+        label = copy_core.drive_label(volume)
         self.eject_button.setEnabled(True)
 
-        if code == 0:
-            self.append_log([("info", volume.name + " was ejected. You can unplug it now.")])
+        if ok:
+            self.append_log([("info", label + " was ejected. You can unplug it now.")])
         else:
             self.append_log([(
                 "error",
-                "Could not eject " + volume.name + " — "
+                "Could not eject " + label + " — "
                 + (output.strip() or "it may still be in use"),
             )])
 
+        self.source_field.refresh()
         self.destination_field.refresh()
         self.update_options()
 
@@ -1396,17 +1621,20 @@ class MainWindow(QMainWindow):
                 continue
 
         if not isinstance(settings, dict):
-            self.update_options()
             return
 
-        source = settings.get("source", "")
-        destination = settings.get("destination", "")
+        for mode, source_key, destination_key in (
+            (MODE_BACKUP, "source", "destination"),
+            (MODE_IMPORT, "import_source", "import_destination"),
+        ):
+            for index, key in enumerate((source_key, destination_key)):
+                value = settings.get(key)
 
-        if isinstance(source, str):
-            self.source_field.set_text(source)
+                if isinstance(value, str):
+                    self.folders[mode][index] = value
 
-        if isinstance(destination, str):
-            self.destination_field.set_text(destination)
+        if not IS_WINDOWS and settings.get("mode") in (MODE_BACKUP, MODE_IMPORT):
+            self.mode = settings["mode"]
 
         for key, box in self.option_boxes().items():
             value = settings.get(key)
@@ -1416,22 +1644,29 @@ class MainWindow(QMainWindow):
                 box.setChecked(value)
                 box.blockSignals(False)
 
-        self.update_options()
-
     def option_boxes(self):
         return {
             "windows_safe": self.windows_box,
             "back_up_database": self.database_box,
             "export_playlists": self.playlists_box,
+            "add_to_musicbee": self.musicbee_box,
         }
 
     def save_settings(self):
         try:
             CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
+            self.folders[self.mode] = [
+                self.source_field.text(),
+                self.destination_field.text(),
+            ]
+
             settings = {
-                "source": self.source_field.text(),
-                "destination": self.destination_field.text(),
+                "mode": self.mode,
+                "source": self.folders[MODE_BACKUP][0],
+                "destination": self.folders[MODE_BACKUP][1],
+                "import_source": self.folders[MODE_IMPORT][0],
+                "import_destination": self.folders[MODE_IMPORT][1],
             }
 
             for key, box in self.option_boxes().items():
@@ -1513,9 +1748,16 @@ class MainWindow(QMainWindow):
         self.percent_label.setText("")
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
-        self.detail_label.setText(
-            "Choose your music folder and the backup drive, then Preview or Back Up."
-        )
+        if self.mode == MODE_IMPORT:
+            self.detail_label.setText(
+                "Plug in the USB stick, choose where the music should go, "
+                "then Preview or Import."
+            )
+        else:
+            self.detail_label.setText(
+                "Choose your music folder and the backup drive, then Preview "
+                "or Back Up."
+            )
         self.current_label.set_full_text("")
         self.set_tiles()
 
@@ -1527,7 +1769,16 @@ class MainWindow(QMainWindow):
         self.source_field.set_locked(running)
         self.destination_field.set_locked(running)
 
-        for box in (self.windows_box, self.playlists_box, self.music_button):
+        if hasattr(self, "mode_box"):
+            self.mode_box.setEnabled(not running)
+
+        for box in (
+            self.windows_box,
+            self.playlists_box,
+            self.music_button,
+            self.detect_button,
+            self.musicbee_box,
+        ):
             box.setEnabled(not running)
 
         if running:
@@ -1566,9 +1817,13 @@ class MainWindow(QMainWindow):
         self.set_tiles()
         self.set_running(True)
 
+        importing = self.mode == MODE_IMPORT
         library = None
 
-        if self.database_box.isChecked():
+        # An import only copies what's on the stick, as it is: names are
+        # already Windows-safe and the database and playlists come along
+        # in Library Backups.
+        if not importing and self.database_box.isChecked():
             library = copy_core.find_music_library(source)
 
         self.thread = QThread(self)
@@ -1576,9 +1831,9 @@ class MainWindow(QMainWindow):
             source,
             destination,
             preview,
-            windows_safe=self.windows_box.isChecked(),
+            windows_safe=not importing and self.windows_box.isChecked(),
             library=library,
-            export_playlists=self.playlists_box.isChecked(),
+            export_playlists=not importing and self.playlists_box.isChecked(),
             check_folders=check_folders,
         )
         self.worker.moveToThread(self.thread)
@@ -1709,9 +1964,92 @@ class MainWindow(QMainWindow):
         self.detail_label.setText(detail)
         self.append_log([("info", title + ". " + detail)])
 
+        if (
+            self.mode == MODE_IMPORT
+            and not stats["preview"]
+            and stats["phase"] == "done"
+        ):
+            self.log_import_next_steps()
+
         self.set_running(False)
         self.destination_field.refresh()
         QApplication.alert(self)
+
+    def log_import_next_steps(self):
+        destination = self.destination_field.text()
+        playlists = copy_core.latest_playlists_folder(destination)
+
+        if playlists is None:
+            return
+
+        self.append_log([("info", "Playlists are in " + str(playlists))])
+
+        target = copy_core.musicbee_playlists_folder()
+
+        if self.musicbee_box.isChecked() and target is not None:
+            try:
+                counts = copy_core.add_playlists_to_musicbee(
+                    playlists, target, CONFIG_DIR / "musicbee_playlists.json"
+                )
+            except OSError as error:
+                self.append_log([(
+                    "error",
+                    "Could not add playlists to MusicBee — "
+                    + (error.strerror or str(error)),
+                )])
+                return
+
+            parts = []
+
+            for key, text in (
+                ("written", "added"),
+                ("updated", "updated"),
+                ("unchanged", "already up to date"),
+            ):
+                if counts[key]:
+                    parts.append(plural(counts[key], "playlist") + " " + text)
+
+            self.append_log([(
+                "copied",
+                "MusicBee playlists: " + (", ".join(parts) or "none to add")
+                + " (" + plural(counts["tracks"], "track") + ").",
+            )])
+
+            if counts["kept_edited"]:
+                self.append_log([(
+                    "warning",
+                    plural(counts["kept_edited"], "playlist")
+                    + " changed in MusicBee since the last import, so the Mac "
+                    "version wasn't applied. Delete one in MusicBee to bring "
+                    "it back from the newest backup.",
+                )])
+
+            if counts["kept_other"]:
+                self.append_log([(
+                    "warning",
+                    plural(counts["kept_other"], "playlist")
+                    + " already in MusicBee with the same name were kept "
+                    "(not created by this app).",
+                )])
+
+            if counts["left_out"]:
+                self.append_log([(
+                    "info",
+                    "Left out " + plural(counts["left_out"], "track")
+                    + " not found on this computer.",
+                )])
+
+            self.append_log([(
+                "info", "If they don't show up, restart MusicBee."
+            )])
+            return
+
+        self.append_log([(
+            "info",
+            "In MusicBee: File → Scan Folders for New Files, choose "
+            + destination
+            + ", then drag the .m3u8 files onto the Playlists panel.",
+        )])
 
     @Slot()
     def cleanup_thread(self):

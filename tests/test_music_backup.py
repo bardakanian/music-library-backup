@@ -352,8 +352,10 @@ class SettingsMigrationTests(unittest.TestCase):
             old = Path(temp) / "old" / "settings.json"
             write(old, json.dumps({"source": temp, "destination": temp}))
 
+            # This checks the Mac backup mode, which Windows doesn't open in.
             with mock.patch.object(app_qt, "CONFIG_FILE", Path(temp) / "new" / "settings.json"), \
-                    mock.patch.object(app_qt, "OLD_CONFIG_FILE", old):
+                    mock.patch.object(app_qt, "OLD_CONFIG_FILE", old), \
+                    mock.patch.object(app_qt, "IS_WINDOWS", False):
                 window = app_qt.MainWindow()
 
                 try:
