@@ -2,6 +2,11 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 2.2.2 — 2026-11-12
+
+- Removed: the **Eject** button on the Windows side. Windows has no "Eject" action for USB hard drives that it lists as ordinary disks, and the safe-removal call it does offer was refused by Windows for reasons the app couldn't identify. Use the Windows "Safely Remove Hardware" icon in the taskbar after an import. Eject on the Mac is unchanged.
+- A hard crash of the app now leaves a trace in `crash.log` in the settings folder.
+
 ## 2.2.1 — 2026-11-12
 
 - Fix: automatic stick detection no longer picks a drive just because it has a folder named `Music`. It now needs a `Library Backups` folder; the looser match is only used when you click **Find USB stick**.

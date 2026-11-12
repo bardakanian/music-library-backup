@@ -40,8 +40,8 @@ app imports the stick into your music folder and adds the playlists to MusicBee.
 - **Import to this computer** (the Windows side): copies the music from the stick onto
   the PC, adding only what's missing. It finds the stick for you, and
   **Add playlists to MusicBee** puts the playlists into MusicBee with full paths.
-- **Eject** the stick from the app when the backup or import is done, on Mac and
-  Windows.
+- **Eject** the stick from the app on the Mac when the backup is done. (On Windows,
+  use the taskbar's "Safely Remove Hardware" icon after an import.)
 - Warns before copying your library a second time when the music folder and the
   destination are one folder level apart, and offers to switch to the matching folder.
 - **Cancel** stops right away, even in the middle of a large file, and removes the
@@ -110,7 +110,8 @@ with the menu at the top right.)
 4. **Add playlists to MusicBee** (on by default) then copies the newest backup's
    playlists into `Music\MusicBee\Playlists`, with full paths, because the relative
    paths in the backup stop working once a file is moved.
-5. Click **Eject** and unplug the stick.
+5. Remove the stick safely with the "Safely Remove Hardware" icon in the Windows
+   taskbar (the app has no Eject button on Windows), then unplug it.
 
 How playlists are kept up to date: a playlist the app wrote earlier is updated on
 the next import, so edits made on the Mac come through, but only while it is
@@ -290,8 +291,8 @@ test checks that they match.
 - **The stick has `._` files from older versions:** the app now removes the ones
   it creates, but copies made before 2.0.1 left one beside every file. Run
   `dot_clean -m /Volumes/<stick name>` in Terminal to remove them.
-- **Eject fails:** close any Finder or Explorer window or app that's using the stick,
-  then try again. On Windows the app reports success only once the drive has gone.
+- **Eject fails (Mac):** close any Finder window or app that's using the stick, then
+  try again.
 - **Windows: "Folder not found. Is the USB stick plugged in?":** plug the stick in
   and switch back to the app, or click **Find USB stick**.
 - **Windows: playlists are missing in MusicBee:** the app only adds them if
@@ -299,9 +300,6 @@ test checks that they match.
   MusicBee after an import.
 - **Windows: a copy fails on a very long path:** turn on long path support in Windows,
   or import to a shorter folder such as `D:\Music`.
-- **Windows: no Eject button for a USB hard drive:** the app only offers Eject for
-  drives Windows reports as removable, and some USB hard drives are reported as fixed
-  disks. Use the Windows "Safely Remove Hardware" icon for those.
 - **Windows: the stick isn't found automatically:** the app looks for a `Library Backups`
   folder. **Find USB stick** also accepts a drive with a plain `Music` folder.
 

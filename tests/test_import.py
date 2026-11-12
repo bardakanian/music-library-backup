@@ -114,6 +114,15 @@ class ImportWindowTests(unittest.TestCase):
             self.assertEqual(results[-1]["to_copy"], 0)
 
     def test_mode_switch_keeps_each_modes_folders(self):
+        # Never touch the real settings file: closing a window saves it.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+
+        for name, file in (("CONFIG_FILE", "new.json"), ("OLD_CONFIG_FILE", "old.json")):
+            patcher = unittest.mock.patch.object(app_qt, name, Path(temp.name) / file)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
         window = app_qt.MainWindow()
         self.addCleanup(window.close)
         window.folders = {
@@ -241,26 +250,6 @@ class PartialNameTests(unittest.TestCase):
         self.assertTrue(copy_core.is_junk(name))
 
 
-class EjectTargetTests(unittest.TestCase):
-    def test_empty_path_has_no_drive(self):
-        self.assertIsNone(copy_core.ejectable_drive(""))
-
-    @unittest.skipUnless(os.name == "nt", "Windows drive letters")
-    def test_only_removable_drives_are_offered(self):
-        stick = Path("E:\\Music")
-
-        with unittest.mock.patch.object(Path, "exists", return_value=True):
-            with unittest.mock.patch.object(copy_core, "is_removable_drive", return_value=False):
-                self.assertIsNone(copy_core.ejectable_drive(str(stick)))
-
-            with unittest.mock.patch.object(copy_core, "is_removable_drive", return_value=True):
-                self.assertEqual(copy_core.ejectable_drive(str(stick)), Path("E:\\"))
-
-    @unittest.skipUnless(os.name == "nt", "Windows drive letters")
-    def test_system_drive_is_never_offered(self):
-        self.assertIsNone(copy_core.windows_drive_of("C:\\Users\\x"))
-        self.assertEqual(copy_core.windows_drive_of("E:\\Music"), Path("E:\\"))
-        self.assertEqual(copy_core.drive_label(Path("E:\\")), "E:")
 
 
 if __name__ == "__main__":

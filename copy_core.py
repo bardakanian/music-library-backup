@@ -876,56 +876,6 @@ def write_playlists(
     return written, tracks_written, left_out
 
 
-def windows_drive_of(path):
-    """Return E:\\ for a path on a drive other than the system drive."""
-    if os.name != "nt":
-        return None
-
-    drive = os.path.splitdrive(os.path.abspath(path))[0]
-    system = os.environ.get("SystemDrive", "C:").rstrip("\\/").upper()
-
-    if len(drive) != 2 or drive[1] != ":" or drive.upper() == system:
-        return None
-
-    return Path(drive + "\\")
-
-
-DRIVE_REMOVABLE = 2
-
-
-def is_removable_drive(root):
-    """True if Windows reports the drive as removable (USB sticks, cards)."""
-    try:
-        import ctypes
-
-        return ctypes.windll.kernel32.GetDriveTypeW(str(root)) == DRIVE_REMOVABLE
-    except (OSError, AttributeError):
-        return False
-
-
-def ejectable_drive(path):
-    """The external drive a path is on, or None if it isn't on one."""
-    path = path or ""
-
-    if not path.strip():
-        return None
-
-    drive = windows_drive_of(path)
-
-    if drive is not None:
-        # Internal disks can't be ejected, so Windows would just ignore it.
-        if drive.exists() and is_removable_drive(drive):
-            return drive
-
-        return None
-
-    return volume_of(path)
-
-
-def drive_label(volume):
-    return volume.name or str(volume).rstrip("\\/")
-
-
 def volume_of(path):
     """Return /Volumes/<name> for a path on an external drive, else None."""
     parts = Path(os.path.abspath(path)).parts

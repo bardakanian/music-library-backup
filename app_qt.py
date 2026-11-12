@@ -58,7 +58,7 @@ from copy_core import format_size
 APP_NAME = "Music Library Backup"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -1500,17 +1500,9 @@ class MainWindow(QMainWindow):
         self.show_idle()
         self.update_options()
 
-    def eject_target(self):
-        """The drive to eject: the stick in an import, else the backup drive."""
-        field = (
-            self.source_field if self.mode == MODE_IMPORT
-            else self.destination_field
-        )
-        return copy_core.ejectable_drive(field.text())
-
     def update_options(self):
         if self.mode == MODE_IMPORT:
-            self.update_eject_button()
+            self.eject_button.hide()
             return
 
         library = copy_core.find_music_library(self.source_field.text())
@@ -1522,16 +1514,11 @@ class MainWindow(QMainWindow):
 
         self.database_box.setEnabled(library is not None and self.thread is None)
 
-        self.update_eject_button()
-
-    def update_eject_button(self):
-        volume = self.eject_target()
+        volume = copy_core.volume_of(self.destination_field.text() or "/")
         self.eject_button.setVisible(volume is not None and self.thread is None)
 
         if volume is not None:
-            self.eject_button.setText(
-                "Eject “" + copy_core.drive_label(volume) + "”"
-            )
+            self.eject_button.setText("Eject “" + volume.name + "”")
 
     def use_music_library(self):
         media = copy_core.default_media_folder()
@@ -1551,61 +1538,37 @@ class MainWindow(QMainWindow):
         self.on_folders_changed()
 
     def eject_destination(self):
-        volume = self.eject_target()
+        volume = copy_core.volume_of(self.destination_field.text() or "/")
 
         if volume is None or self.eject_process is not None:
             return
 
-        label = copy_core.drive_label(volume)
         self.eject_button.setEnabled(False)
-        self.append_log([("info", "Ejecting " + label + " …")])
+        self.append_log([("info", "Ejecting " + volume.name + " …")])
 
-        # Ejecting can take a few seconds; QProcess keeps the window responsive.
+        # diskutil can take a few seconds; QProcess keeps the window responsive.
         process = QProcess(self)
         process.finished.connect(
             lambda code, _status: self.eject_finished(process, volume, code)
         )
         self.eject_process = process
-
-        if IS_WINDOWS:
-            letter = str(volume).rstrip("\\/")
-            process.start("powershell", [
-                "-NoProfile", "-Command",
-                "(New-Object -ComObject Shell.Application)"
-                ".Namespace(17).ParseName('" + letter + "').InvokeVerb('Eject')",
-            ])
-        else:
-            process.start("diskutil", ["eject", str(volume)])
+        process.start("diskutil", ["eject", str(volume)])
 
     def eject_finished(self, process, volume, code):
         output = bytes(process.readAllStandardError()).decode(errors="replace")
         self.eject_process = None
         process.deleteLater()
-
-        if IS_WINDOWS and code == 0:
-            # Windows ejects in the background and reports nothing, so check
-            # whether the drive has gone.
-            QTimer.singleShot(
-                2500, lambda: self.finish_eject(volume, not volume.exists(), "")
-            )
-            return
-
-        self.finish_eject(volume, code == 0, output)
-
-    def finish_eject(self, volume, ok, output):
-        label = copy_core.drive_label(volume)
         self.eject_button.setEnabled(True)
 
-        if ok:
-            self.append_log([("info", label + " was ejected. You can unplug it now.")])
+        if code == 0:
+            self.append_log([("info", volume.name + " was ejected. You can unplug it now.")])
         else:
             self.append_log([(
                 "error",
-                "Could not eject " + label + " — "
+                "Could not eject " + volume.name + " — "
                 + (output.strip() or "it may still be in use"),
             )])
 
-        self.source_field.refresh()
         self.destination_field.refresh()
         self.update_options()
 
@@ -2117,6 +2080,17 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # A hard crash (not a normal error) would otherwise leave no trace,
+    # especially when started without a console.
+    try:
+        import faulthandler
+
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        crash_log = open(CONFIG_DIR / "crash.log", "a", encoding="utf-8")
+        faulthandler.enable(file=crash_log)
+    except (OSError, RuntimeError, ValueError):
+        pass
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(VERSION)
