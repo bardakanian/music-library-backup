@@ -2,6 +2,10 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 2.1.1 — 2026-11-11
+
+- The GitHub repository is now `bardakanian/music-library-backup` (renamed from `copy-missing-files`; old links redirect). README clone instructions updated.
+
 ## 2.1.0 — 2026-11-11
 
 - New safety check: when far more files look missing than are already there, the app checks whether the music folder and destination are one folder level apart (for example `~/Music/Music` instead of `Media.localized/Music`, or `Stick` instead of `Stick/Music`), which would copy the whole library a second time. Preview shows a warning; Back Up stops before copying and offers **Use That Folder**, **Back Up Anyway** or Cancel.

@@ -120,8 +120,8 @@ which case it's reported). Empty folders aren't copied.
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/bardakanian/copy-missing-files.git
-cd copy-missing-files
+git clone https://github.com/bardakanian/music-library-backup.git
+cd music-library-backup
 ```
 
 ### 2. Create a virtual environment and install PySide6

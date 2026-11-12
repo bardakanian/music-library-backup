@@ -56,7 +56,7 @@ from copy_core import format_size
 APP_NAME = "Music Library Backup"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 CONFIG_DIR = (
     Path.home()
