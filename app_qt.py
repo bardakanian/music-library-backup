@@ -58,7 +58,7 @@ from copy_core import format_size
 APP_NAME = "Music Library Backup"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -1422,7 +1422,7 @@ class MainWindow(QMainWindow):
         return str(drives[0][1]) if len(drives) == 1 else None
 
     def find_stick(self):
-        drives = copy_core.find_backup_drives()
+        drives = copy_core.find_backup_drives(loose=True)
 
         if not drives:
             QMessageBox.information(

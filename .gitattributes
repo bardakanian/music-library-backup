@@ -1,0 +1,4 @@
+# The Windows launcher must keep CRLF line endings, or cmd can misread its labels.
+*.bat -text
+# The macOS launcher must keep LF line endings.
+*.command text eol=lf

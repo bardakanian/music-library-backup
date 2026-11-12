@@ -2,6 +2,13 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 2.2.1 — 2026-11-12
+
+- Fix: automatic stick detection no longer picks a drive just because it has a folder named `Music`. It now needs a `Library Backups` folder; the looser match is only used when you click **Find USB stick**.
+- Fix: the Windows launcher is stored with Windows line endings (and `.gitattributes` keeps `.bat` and `.command` files right), so it also works from a downloaded ZIP.
+- Fix: playlists the app wrote earlier are managed again if `musicbee_playlists.json` is lost, as long as they still match; and what was written so far is remembered even if a later playlist fails.
+- Fix: **Eject** is only offered for removable drives on Windows, so an internal disk no longer gets a button that can't work.
+
 ## 2.2.0 — 2026-11-12
 
 - New **Import to this computer** mode for the Windows side. It copies the music from a Music Library Backup stick onto the PC, adding only what's missing and never overwriting. **Library Backups** (the database copy and the `.m3u8` playlists) comes along as it is. On Windows the app opens in this mode; on a Mac, switch with the menu in the header.

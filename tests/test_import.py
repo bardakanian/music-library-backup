@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -33,10 +34,12 @@ class FindBackupTests(unittest.TestCase):
             copy_core.find_backup_folder(self.root), self.root / "Tunes"
         )
 
-    def test_plain_music_folder_is_used(self):
+    def test_plain_music_folder_is_only_a_loose_match(self):
         write(self.root / "music" / "a.m4a")
+        self.assertIsNone(copy_core.find_backup_folder(self.root))
         self.assertEqual(
-            copy_core.find_backup_folder(self.root), self.root / "music"
+            copy_core.find_backup_folder(self.root, loose=True),
+            self.root / "music",
         )
 
     def test_nothing_found(self):
@@ -45,12 +48,18 @@ class FindBackupTests(unittest.TestCase):
 
     def test_drives_without_a_backup_are_left_out(self):
         stick = self.root / "stick"
+        own_music = self.root / "own"
         other = self.root / "other"
-        write(stick / "Music" / "a.m4a")
+        write(stick / "Music" / "Library Backups" / "d" / "x.txt")
+        write(own_music / "Music" / "a.m4a")
         write(other / "Photos" / "a.jpg")
         self.assertEqual(
-            copy_core.find_backup_drives([stick, other]),
+            copy_core.find_backup_drives([stick, own_music, other]),
             [(stick, stick / "Music")],
+        )
+        self.assertEqual(
+            len(copy_core.find_backup_drives([stick, own_music, other], loose=True)),
+            2,
         )
 
 
@@ -178,6 +187,35 @@ class MusicBeePlaylistTests(unittest.TestCase):
         self.assertEqual(counts["kept_edited"], 1)
         self.assertEqual((self.target / "Mix.m3u8").read_text(encoding="utf-8"), "mine")
 
+    def test_identical_playlist_is_adopted_when_memory_is_lost(self):
+        self.playlist(self.song1)
+        self.run_import()
+        self.state.unlink()
+
+        self.assertEqual(self.run_import()["unchanged"], 1)
+        self.playlist(self.song1, self.song2)
+        self.assertEqual(self.run_import()["updated"], 1)
+
+    def test_memory_is_saved_even_if_a_later_playlist_fails(self):
+        self.playlist(self.song1)
+        write(self.folder / "Zed.m3u8", "#EXTM3U\r\n")
+        real = copy_core.fingerprint
+        calls = []
+
+        def failing(data):
+            calls.append(1)
+            if len(calls) > 1:
+                raise OSError("disk full")
+            return real(data)
+
+        with unittest.mock.patch.object(copy_core, "fingerprint", failing):
+            with self.assertRaises(OSError):
+                self.run_import()
+
+        self.assertIn("mix.m3u8", copy_core.load_playlist_state(self.state)[
+            str(self.target).casefold()
+        ])
+
     def test_playlist_made_in_musicbee_is_never_touched(self):
         write(self.target / "Mix.m3u8", "mine")
         self.playlist(self.song1)
@@ -206,6 +244,17 @@ class PartialNameTests(unittest.TestCase):
 class EjectTargetTests(unittest.TestCase):
     def test_empty_path_has_no_drive(self):
         self.assertIsNone(copy_core.ejectable_drive(""))
+
+    @unittest.skipUnless(os.name == "nt", "Windows drive letters")
+    def test_only_removable_drives_are_offered(self):
+        stick = Path("E:\\Music")
+
+        with unittest.mock.patch.object(Path, "exists", return_value=True):
+            with unittest.mock.patch.object(copy_core, "is_removable_drive", return_value=False):
+                self.assertIsNone(copy_core.ejectable_drive(str(stick)))
+
+            with unittest.mock.patch.object(copy_core, "is_removable_drive", return_value=True):
+                self.assertEqual(copy_core.ejectable_drive(str(stick)), Path("E:\\"))
 
     @unittest.skipUnless(os.name == "nt", "Windows drive letters")
     def test_system_drive_is_never_offered(self):

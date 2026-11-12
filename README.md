@@ -299,8 +299,11 @@ test checks that they match.
   MusicBee after an import.
 - **Windows: a copy fails on a very long path:** turn on long path support in Windows,
   or import to a shorter folder such as `D:\Music`.
-- **Windows: the stick is on a USB hard drive:** if Eject says it may still be in use,
-  use the Windows "Safely Remove Hardware" icon instead.
+- **Windows: no Eject button for a USB hard drive:** the app only offers Eject for
+  drives Windows reports as removable, and some USB hard drives are reported as fixed
+  disks. Use the Windows "Safely Remove Hardware" icon for those.
+- **Windows: the stick isn't found automatically:** the app looks for a `Library Backups`
+  folder. **Find USB stick** also accepts a drive with a plain `Music` folder.
 
 ## Project status
 

@@ -890,6 +890,19 @@ def windows_drive_of(path):
     return Path(drive + "\\")
 
 
+DRIVE_REMOVABLE = 2
+
+
+def is_removable_drive(root):
+    """True if Windows reports the drive as removable (USB sticks, cards)."""
+    try:
+        import ctypes
+
+        return ctypes.windll.kernel32.GetDriveTypeW(str(root)) == DRIVE_REMOVABLE
+    except (OSError, AttributeError):
+        return False
+
+
 def ejectable_drive(path):
     """The external drive a path is on, or None if it isn't on one."""
     path = path or ""
@@ -900,7 +913,11 @@ def ejectable_drive(path):
     drive = windows_drive_of(path)
 
     if drive is not None:
-        return drive if drive.exists() else None
+        # Internal disks can't be ejected, so Windows would just ignore it.
+        if drive.exists() and is_removable_drive(drive):
+            return drive
+
+        return None
 
     return volume_of(path)
 
@@ -1076,11 +1093,13 @@ def list_drive_roots():
     return roots
 
 
-def find_backup_folder(root):
+def find_backup_folder(root, loose=False):
     """Find the music folder a Music Library Backup left on a drive.
 
-    The backup folder is the one that holds "Library Backups". Failing that,
-    a folder named "Music" on the drive is used. Returns None if neither exists.
+    The backup folder is the one that holds "Library Backups". With loose,
+    a folder named "Music" on the drive is used when there is none. That
+    guess is only for when the user asks to look, because any drive with a
+    Music folder of its own would match. Returns None if nothing fits.
     """
     root = Path(root)
 
@@ -1105,19 +1124,20 @@ def find_backup_folder(root):
         except OSError:
             continue
 
-    for child in children:
-        if child.name.casefold() == "music":
-            return child
+    if loose:
+        for child in children:
+            if child.name.casefold() == "music":
+                return child
 
     return None
 
 
-def find_backup_drives(roots=None):
+def find_backup_drives(roots=None, loose=False):
     """Return [(drive root, backup folder)] for drives holding a backup."""
     found = []
 
     for root in (list_drive_roots() if roots is None else roots):
-        folder = find_backup_folder(root)
+        folder = find_backup_folder(root, loose)
 
         if folder is not None:
             found.append((Path(root), folder))
@@ -1203,6 +1223,17 @@ def add_playlists_to_musicbee(playlists_folder, target_folder, state_file=None):
         tracks=0, left_out=0,
     )
 
+    try:
+        _add_playlists(playlists_folder, target_folder, mine, counts)
+    finally:
+        # Even after a failure, remember what was written so far.
+        if state_file:
+            save_playlist_state(state_file, state)
+
+    return counts
+
+
+def _add_playlists(playlists_folder, target_folder, mine, counts):
     for playlist in sorted(playlists_folder.glob("*.m3u8")):
         target = target_folder / playlist.name
         key = playlist.name.casefold()
@@ -1233,10 +1264,12 @@ def add_playlists_to_musicbee(playlists_folder, target_folder, state_file=None):
         if target.exists():
             current = fingerprint(target.read_bytes())
 
-            if key not in mine:
-                outcome = "kept_other"
-            elif current == new_print:
+            if current == new_print:
+                # Identical to what this app would write, whoever wrote it
+                # (the memory file may have been lost), so manage it again.
                 outcome = "unchanged"
+            elif key not in mine:
+                outcome = "kept_other"
             elif current == mine[key]:
                 outcome = "updated"
             else:
@@ -1254,8 +1287,3 @@ def add_playlists_to_musicbee(playlists_folder, target_folder, state_file=None):
         if outcome in ("written", "updated", "unchanged"):
             counts["tracks"] += tracks
             counts["left_out"] += left_out
-
-    if state_file:
-        save_playlist_state(state_file, state)
-
-    return counts
