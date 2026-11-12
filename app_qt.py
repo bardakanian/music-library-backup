@@ -3,11 +3,22 @@ import json
 import sys
 import threading
 import time
+from datetime import datetime
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRectF, QThread, QUrl, Qt, Signal, Slot
+from PySide6.QtCore import (
+    QObject,
+    QProcess,
+    QRectF,
+    QThread,
+    QTimer,
+    QUrl,
+    Qt,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -21,6 +32,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -41,10 +53,10 @@ import copy_core
 from copy_core import format_size
 
 
-APP_NAME = "Copy Missing Files"
+APP_NAME = "Music Library Backup"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "1.4.0"
+VERSION = "2.1.0"
 
 CONFIG_DIR = (
     Path.home()
@@ -55,6 +67,15 @@ CONFIG_DIR = (
 
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 
+# Settings saved before the app was renamed from Copy Missing Files.
+OLD_CONFIG_FILE = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "Copy Missing Files"
+    / "settings.json"
+)
+
 MAX_LOG_ENTRIES = 200000
 
 ACCENT = "#2f6fde"
@@ -64,6 +85,7 @@ LOG_PREFIXES = {
     "missing": "+ ",
     "copied": "✓ ",
     "skipped": "– ",
+    "warning": "⚠ ",
     "error": "✕ ",
 }
 
@@ -71,7 +93,7 @@ LOG_FILTERS = [
     ("All activity", None),
     ("Copied", {"copied"}),
     ("To copy", {"missing"}),
-    ("Problems", {"skipped", "error"}),
+    ("Problems", {"skipped", "warning", "error"}),
 ]
 
 
@@ -259,11 +281,24 @@ class CopyWorker(QObject):
     progress = Signal(dict)
     finished = Signal(dict)
 
-    def __init__(self, source, destination, preview=False):
+    def __init__(
+        self,
+        source,
+        destination,
+        preview=False,
+        windows_safe=False,
+        library=None,
+        export_playlists=False,
+        check_folders=True,
+    ):
         super().__init__()
         self.source = source
         self.destination = destination
         self.preview = preview
+        self.windows_safe = windows_safe
+        self.library = library
+        self.export_playlists = export_playlists
+        self.check_folders = check_folders
         self.cancel_requested = False
 
         self.pending_log = []
@@ -292,6 +327,9 @@ class CopyWorker(QObject):
             "current": "",
             "copy_seconds": 0.0,
             "message": "",
+            "warnings": 0,
+            "snapshot": "",
+            "mismatch": None,
         }
 
     def cancel(self):
@@ -345,18 +383,44 @@ class CopyWorker(QObject):
                 self.destination,
                 self.is_cancelled,
                 self.on_scanned,
+                self.windows_safe,
             )
             self.record_plan(plan)
+            mismatch = None
 
-            if self.preview:
+            # Far more missing than already there may mean the folders are
+            # one level apart, which would copy the whole library again.
+            if self.check_folders and len(plan.items) > plan.existing:
+                mismatch = copy_core.better_folder_match(
+                    self.source, self.destination
+                )
+
+            if mismatch is not None:
+                stats["mismatch"] = mismatch
+                stats["warnings"] += 1
+                self.add_log("warning", mismatch["message"])
+
+            if mismatch is not None and not self.preview:
+                stats["phase"] = "mismatch"
+                self.add_log("info", "Nothing was copied.")
+            elif self.preview:
                 for item in plan.items:
                     size = "link" if item.is_symlink else format_size(item.size)
-                    self.add_log(
-                        "missing",
-                        str(item.relative) + "  (" + size + ")",
-                    )
+                    name = str(item.relative)
+
+                    if item.target != item.relative:
+                        name += "  → " + str(item.target)
+
+                    self.add_log("missing", name + "  (" + size + ")")
+
+                self.describe_library_backup()
             else:
                 self.copy_items(plan)
+
+                if not self.should_stop_copy() and (
+                    self.library is not None or self.export_playlists
+                ):
+                    self.back_up_library()
 
         except copy_core.Cancelled:
             stats["phase"] = "cancelled"
@@ -365,7 +429,7 @@ class CopyWorker(QObject):
             stats["failed"] += 1
             self.stop("Unexpected error: " + str(error))
 
-        if stats["phase"] in ("scanning", "copying"):
+        if stats["phase"] in ("scanning", "copying", "library"):
             stats["phase"] = "done"
 
         stats["current"] = ""
@@ -386,16 +450,177 @@ class CopyWorker(QObject):
         for path, reason in plan.errors:
             self.add_log("error", "Could not read " + str(path) + " — " + reason)
 
-        self.add_log(
-            "info",
+        stats["warnings"] = len(plan.warnings)
+
+        for target, reason in plan.warnings:
+            self.add_log("warning", str(target) + " — " + reason)
+
+        summary = (
             "Found "
             + plural(len(plan.items), "missing file")
             + " ("
             + format_size(plan.total_bytes)
             + "), "
             + f"{plan.existing:,}"
-            + " already in the destination.",
+            + " already in the destination."
         )
+
+        if plan.renamed:
+            summary += (
+                " " + plural(plan.renamed, "name")
+                + " changed to be Windows-safe."
+            )
+
+        if plan.ignored:
+            summary += (
+                " Left out " + plural(plan.ignored, "Mac-only system file") + "."
+            )
+
+        self.add_log("info", summary)
+
+    def describe_library_backup(self):
+        if self.library is not None:
+            self.add_log(
+                "info",
+                "Will also save a dated copy of the library database ("
+                + self.library.name + ").",
+            )
+
+        if self.export_playlists:
+            self.add_log(
+                "info",
+                "Will also export playlists as .m3u8 files for MusicBee.",
+            )
+
+    def back_up_library(self):
+        """Save the library database and playlists in a new dated folder."""
+        stats = self.stats
+        stats["phase"] = "library"
+        stats["current"] = ""
+        self.emit_progress(force=True)
+
+        try:
+            if not self.destination.exists():
+                self.destination.mkdir()
+                copy_core.drop_appledouble(self.destination)
+
+            folder = copy_core.snapshot_folder(
+                self.destination,
+                copy_core.snapshot_stamp(datetime.now()),
+            )
+        except copy_core.DestinationGone:
+            self.stop_once(
+                "The destination folder is no longer available. "
+                "Is the drive still connected?"
+            )
+            return
+        except OSError as error:
+            stats["failed"] += 1
+            self.add_log(
+                "error",
+                "Could not create the library backup folder — "
+                + (error.strerror or str(error)),
+            )
+            return
+
+        stats["snapshot"] = str(folder)
+
+        try:
+            if self.library is not None:
+                self.back_up_database(folder)
+
+            if self.export_playlists and not self.should_stop_copy():
+                self.save_playlists(folder)
+        finally:
+            # Don't leave an empty dated folder after a failure or cancel.
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
+            else:
+                stats["snapshot"] = ""
+
+    def back_up_database(self, folder):
+        stats = self.stats
+
+        if copy_core.music_is_running():
+            self.add_log(
+                "info",
+                "Apple Music is open. Quit it first for the most reliable "
+                "database backup.",
+            )
+
+        stats["current"] = "Backing up " + self.library.name
+        self.emit_progress(force=True)
+
+        try:
+            size = copy_core.copy_tree(
+                self.library,
+                folder / self.library.name,
+                self.should_stop_copy,
+            )
+        except copy_core.Cancelled:
+            raise
+        except OSError as error:
+            stats["failed"] += 1
+
+            if error.errno == errno.ENOSPC:
+                self.stop_once("The destination drive is full.")
+            else:
+                self.add_log(
+                    "error",
+                    "Could not back up the library database — "
+                    + (error.strerror or str(error)),
+                )
+            return
+
+        self.add_log(
+            "copied",
+            "Library database saved to "
+            + str(folder.relative_to(self.destination) / self.library.name)
+            + " (" + format_size(size) + ")",
+        )
+
+    def save_playlists(self, folder):
+        stats = self.stats
+        stats["current"] = "Reading playlists from Apple Music"
+        self.emit_progress(force=True)
+
+        try:
+            playlists = copy_core.read_playlists(self.should_stop_copy)
+            written, tracks, left_out = copy_core.write_playlists(
+                playlists,
+                self.source,
+                self.destination,
+                folder / copy_core.PLAYLISTS_FOLDER,
+                self.windows_safe,
+            )
+        except copy_core.PlaylistError as error:
+            stats["failed"] += 1
+            self.add_log("error", str(error))
+            return
+        except OSError as error:
+            stats["failed"] += 1
+            self.add_log(
+                "error",
+                "Could not save playlists — " + (error.strerror or str(error)),
+            )
+            return
+
+        message = (
+            "Exported " + plural(written, "playlist")
+            + " (" + plural(tracks, "track") + ") to "
+            + str(folder.relative_to(self.destination) / copy_core.PLAYLISTS_FOLDER)
+        )
+
+        if left_out:
+            message += (
+                ". Left out " + plural(left_out, "track")
+                + " that aren't files in the source folder"
+                + " (streamed, cloud-only or stored elsewhere)"
+            )
+
+        self.add_log("copied", message + ".")
 
     def copy_items(self, plan):
         stats = self.stats
@@ -417,6 +642,7 @@ class CopyWorker(QObject):
 
         if not self.destination.exists():
             self.destination.mkdir()
+            copy_core.drop_appledouble(self.destination)
             self.add_log("info", "Created " + str(self.destination))
 
         stats["phase"] = "copying"
@@ -493,11 +719,11 @@ class CopyWorker(QObject):
             with self.copy_lock:
                 self.stats["done_bytes"] += count
 
-        guard = guards.get(copy_core.name_key(item.relative), nullcontext())
+        guard = guards.get(copy_core.name_key(item.target), nullcontext())
 
         with guard:
             with self.copy_lock:
-                self.active_items[item.relative] = None
+                self.active_items[item.target] = None
 
             try:
                 copied = copy_core.copy_item(
@@ -515,7 +741,7 @@ class CopyWorker(QObject):
                 raise
             finally:
                 with self.copy_lock:
-                    del self.active_items[item.relative]
+                    del self.active_items[item.target]
 
         return copied, item_bytes
 
@@ -545,7 +771,7 @@ class CopyWorker(QObject):
         if copied:
             stats["copied"] += 1
             stats["copied_bytes"] += item.size
-            self.add_log("copied", str(item.relative))
+            self.add_log("copied", str(item.target))
         else:
             stats["existing"] += 1
 
@@ -788,6 +1014,8 @@ class MainWindow(QMainWindow):
         self.thread = None
         self.worker = None
         self.log_entries = []
+        self.eject_process = None
+        self.pending_mismatch = None
 
         self.build_gui()
         self.load_settings()
@@ -802,6 +1030,7 @@ class MainWindow(QMainWindow):
 
         main.addLayout(self.build_header())
         main.addLayout(self.build_folders())
+        main.addLayout(self.build_options())
         main.addLayout(self.build_actions())
         main.addWidget(self.build_progress())
         main.addLayout(self.build_activity_header())
@@ -836,9 +1065,11 @@ class MainWindow(QMainWindow):
         text.addWidget(title)
 
         subtitle = QLabel(
-            "Adds files that are missing from the destination. "
-            "Nothing there is ever overwritten or deleted."
+            "Copies your Apple Music library to a USB stick or backup drive. "
+            "It only adds what's missing; nothing there is ever overwritten "
+            "or deleted."
         )
+        subtitle.setWordWrap(True)
         subtitle.setObjectName("muted")
         text.addWidget(subtitle)
 
@@ -857,8 +1088,8 @@ class MainWindow(QMainWindow):
         style = self.style()
 
         self.source_field = FolderCard(
-            "Source",
-            "Select Source Folder",
+            "Music folder",
+            "Select Music Folder",
             style.standardIcon(QStyle.SP_DirIcon),
             self.describe_source,
         )
@@ -870,13 +1101,51 @@ class MainWindow(QMainWindow):
         row.addWidget(arrow)
 
         self.destination_field = FolderCard(
-            "Destination",
+            "Backup / USB stick",
             "Select Destination Folder",
             style.standardIcon(QStyle.SP_DriveHDIcon),
             self.describe_destination,
         )
         self.destination_field.changed.connect(self.on_folders_changed)
         row.addWidget(self.destination_field, 1)
+
+        return row
+
+    def build_options(self):
+        row = QHBoxLayout()
+        row.setSpacing(18)
+
+        self.windows_box = QCheckBox("Windows-safe names")
+        self.windows_box.setToolTip(
+            "Replaces characters Windows and exFAT don't allow (such as ? : *),\n"
+            "copies links as real files and flags paths too long for Windows."
+        )
+
+        self.database_box = QCheckBox("Back up library database")
+        self.database_box.setToolTip(
+            "Saves a dated copy of the Music Library database (ratings, play\n"
+            "counts, playlists) in Library Backups. Earlier copies are kept."
+        )
+
+        self.playlists_box = QCheckBox("Export playlists (.m3u8)")
+        self.playlists_box.setToolTip(
+            "Saves each Apple Music playlist as an .m3u8 file that MusicBee\n"
+            "and other Windows players can import."
+        )
+
+        for box in (self.windows_box, self.database_box, self.playlists_box):
+            box.setChecked(True)
+            box.toggled.connect(lambda _checked: self.save_settings())
+            row.addWidget(box)
+
+        row.addStretch(1)
+
+        self.music_button = QPushButton("Use Apple Music Library")
+        self.music_button.setToolTip(
+            "Set the music folder to Apple Music's default media folder."
+        )
+        self.music_button.clicked.connect(self.use_music_library)
+        row.addWidget(self.music_button)
 
         return row
 
@@ -888,11 +1157,16 @@ class MainWindow(QMainWindow):
         hint.setObjectName("muted")
         row.addWidget(hint, 1)
 
+        self.eject_button = QPushButton("Eject")
+        self.eject_button.clicked.connect(self.eject_destination)
+        self.eject_button.hide()
+        row.addWidget(self.eject_button)
+
         self.preview_button = QPushButton("Preview")
         self.preview_button.clicked.connect(lambda: self.start(preview=True))
         row.addWidget(self.preview_button)
 
-        self.start_button = QPushButton("Copy Missing Files")
+        self.start_button = QPushButton("Back Up")
         self.start_button.setObjectName("primary")
         self.start_button.setCursor(Qt.PointingHandCursor)
         self.start_button.setShortcut(QKeySequence("Ctrl+Return"))
@@ -934,6 +1208,7 @@ class MainWindow(QMainWindow):
 
         self.detail_label = QLabel()
         self.detail_label.setObjectName("muted")
+        self.detail_label.setWordWrap(True)
         layout.addWidget(self.detail_label)
 
         self.current_label = ElidedLabel()
@@ -1032,21 +1307,96 @@ class MainWindow(QMainWindow):
         if event.type() == event.Type.ActivationChange and self.isActiveWindow():
             self.source_field.refresh()
             self.destination_field.refresh()
+            self.update_options()
 
         super().changeEvent(event)
 
     def on_folders_changed(self):
         self.save_settings()
         self.show_idle()
+        self.update_options()
 
-    def load_settings(self):
-        try:
-            with CONFIG_FILE.open("r", encoding="utf-8") as file:
-                settings = json.load(file)
-        except (OSError, ValueError):
+    def update_options(self):
+        library = copy_core.find_music_library(self.source_field.text())
+
+        if library is None:
+            self.database_box.setText("Back up library database (not found)")
+        else:
+            self.database_box.setText("Back up library database")
+
+        self.database_box.setEnabled(library is not None and self.thread is None)
+
+        volume = copy_core.volume_of(self.destination_field.text() or "/")
+        self.eject_button.setVisible(volume is not None and self.thread is None)
+
+        if volume is not None:
+            self.eject_button.setText("Eject “" + volume.name + "”")
+
+    def use_music_library(self):
+        media = copy_core.default_media_folder()
+
+        if media is None:
+            QMessageBox.information(
+                self,
+                "Apple Music Library Not Found",
+                "Couldn't find Apple Music's media folder in "
+                + str(copy_core.DEFAULT_MUSIC_FOLDER)
+                + ".\n\nIf you keep your music somewhere else, choose that "
+                "folder instead (Music → Settings → Files shows where).",
+            )
             return
 
+        self.source_field.set_text(str(media))
+        self.on_folders_changed()
+
+    def eject_destination(self):
+        volume = copy_core.volume_of(self.destination_field.text() or "/")
+
+        if volume is None or self.eject_process is not None:
+            return
+
+        self.eject_button.setEnabled(False)
+        self.append_log([("info", "Ejecting " + volume.name + " …")])
+
+        # diskutil can take a few seconds; QProcess keeps the window responsive.
+        process = QProcess(self)
+        process.finished.connect(
+            lambda code, _status: self.eject_finished(process, volume, code)
+        )
+        self.eject_process = process
+        process.start("diskutil", ["eject", str(volume)])
+
+    def eject_finished(self, process, volume, code):
+        output = bytes(process.readAllStandardError()).decode(errors="replace")
+        self.eject_process = None
+        process.deleteLater()
+        self.eject_button.setEnabled(True)
+
+        if code == 0:
+            self.append_log([("info", volume.name + " was ejected. You can unplug it now.")])
+        else:
+            self.append_log([(
+                "error",
+                "Could not eject " + volume.name + " — "
+                + (output.strip() or "it may still be in use"),
+            )])
+
+        self.destination_field.refresh()
+        self.update_options()
+
+    def load_settings(self):
+        settings = None
+
+        for path in (CONFIG_FILE, OLD_CONFIG_FILE):
+            try:
+                with path.open("r", encoding="utf-8") as file:
+                    settings = json.load(file)
+                break
+            except (OSError, ValueError):
+                continue
+
         if not isinstance(settings, dict):
+            self.update_options()
             return
 
         source = settings.get("source", "")
@@ -1058,6 +1408,23 @@ class MainWindow(QMainWindow):
         if isinstance(destination, str):
             self.destination_field.set_text(destination)
 
+        for key, box in self.option_boxes().items():
+            value = settings.get(key)
+
+            if isinstance(value, bool):
+                box.blockSignals(True)
+                box.setChecked(value)
+                box.blockSignals(False)
+
+        self.update_options()
+
+    def option_boxes(self):
+        return {
+            "windows_safe": self.windows_box,
+            "back_up_database": self.database_box,
+            "export_playlists": self.playlists_box,
+        }
+
     def save_settings(self):
         try:
             CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1066,6 +1433,9 @@ class MainWindow(QMainWindow):
                 "source": self.source_field.text(),
                 "destination": self.destination_field.text(),
             }
+
+            for key, box in self.option_boxes().items():
+                settings[key] = box.isChecked()
 
             with CONFIG_FILE.open("w", encoding="utf-8") as file:
                 json.dump(settings, file, indent=4)
@@ -1144,7 +1514,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
         self.detail_label.setText(
-            "Choose the two folders, then Preview or Copy Missing Files."
+            "Choose your music folder and the backup drive, then Preview or Back Up."
         )
         self.current_label.set_full_text("")
         self.set_tiles()
@@ -1157,7 +1527,14 @@ class MainWindow(QMainWindow):
         self.source_field.set_locked(running)
         self.destination_field.set_locked(running)
 
-    def start(self, preview):
+        for box in (self.windows_box, self.playlists_box, self.music_button):
+            box.setEnabled(not running)
+
+        if running:
+            self.database_box.setEnabled(False)
+            self.eject_button.hide()
+
+    def start(self, preview, check_folders=True):
         if self.thread is not None:
             return
 
@@ -1189,8 +1566,21 @@ class MainWindow(QMainWindow):
         self.set_tiles()
         self.set_running(True)
 
+        library = None
+
+        if self.database_box.isChecked():
+            library = copy_core.find_music_library(source)
+
         self.thread = QThread(self)
-        self.worker = CopyWorker(source, destination, preview)
+        self.worker = CopyWorker(
+            source,
+            destination,
+            preview,
+            windows_safe=self.windows_box.isChecked(),
+            library=library,
+            export_playlists=self.playlists_box.isChecked(),
+            check_folders=check_folders,
+        )
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
@@ -1217,6 +1607,14 @@ class MainWindow(QMainWindow):
             self.percent_label.setText("")
             self.progress_bar.setRange(0, 0)
             self.detail_label.setText(f"{stats['scanned']:,} items checked")
+            self.current_label.set_full_text("")
+            return
+
+        if stats["phase"] == "library":
+            self.status_title.setText("Saving library backup…")
+            self.percent_label.setText("")
+            self.progress_bar.setRange(0, 0)
+            self.detail_label.setText(stats["current"])
             self.current_label.set_full_text("")
             return
 
@@ -1255,7 +1653,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1000)
         self.current_label.set_full_text("")
 
-        problems = stats["skipped"] + stats["failed"]
+        problems = stats["skipped"] + stats["failed"] + stats["warnings"]
         problem_text = (
             " · " + plural(problems, "item")
             + (" needs" if problems == 1 else " need")
@@ -1264,7 +1662,11 @@ class MainWindow(QMainWindow):
             else ""
         )
 
-        if stats["phase"] == "stopped":
+        if stats["phase"] == "mismatch":
+            title = "Check your folders"
+            detail = "Nothing was copied. " + stats["mismatch"]["message"]
+            self.pending_mismatch = stats["mismatch"]
+        elif stats["phase"] == "stopped":
             title = "Stopped"
             detail = stats["message"]
         elif stats["phase"] == "cancelled":
@@ -1284,6 +1686,9 @@ class MainWindow(QMainWindow):
                 + " would be copied. Nothing was changed."
                 + problem_text
             )
+
+            if stats["mismatch"]:
+                detail = "Check your folders: " + stats["mismatch"]["message"]
             self.progress_bar.setValue(0)
             self.filter_box.setCurrentIndex(0)
         else:
@@ -1293,6 +1698,10 @@ class MainWindow(QMainWindow):
                 else "Copied " + plural(stats["copied"], "file")
             )
             detail = format_size(stats["copied_bytes"]) + " copied" + problem_text
+
+            if stats["snapshot"]:
+                detail += " · library backup in " + Path(stats["snapshot"]).name
+
             self.progress_bar.setValue(1000)
 
         self.status_title.setText(title)
@@ -1310,6 +1719,42 @@ class MainWindow(QMainWindow):
         self.thread.deleteLater()
         self.worker = None
         self.thread = None
+        self.update_options()
+
+        if self.pending_mismatch is not None:
+            mismatch = self.pending_mismatch
+            self.pending_mismatch = None
+            QTimer.singleShot(0, lambda: self.ask_about_mismatch(mismatch))
+
+    def ask_about_mismatch(self, mismatch):
+        role = "music folder" if mismatch["role"] == "source" else "destination"
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Check Your Folders")
+        box.setText("This would copy your music a second time.")
+        box.setInformativeText(
+            mismatch["message"]
+            + "\n\nUse that folder as the " + role + " instead?"
+        )
+        use_button = box.addButton("Use That Folder", QMessageBox.AcceptRole)
+        anyway_button = box.addButton("Back Up Anyway", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(use_button)
+        box.exec()
+
+        clicked = box.clickedButton()
+
+        if clicked is use_button:
+            field = (
+                self.source_field if mismatch["role"] == "source"
+                else self.destination_field
+            )
+            field.set_text(mismatch["path"])
+            self.on_folders_changed()
+            self.start(preview=True)
+        elif clicked is anyway_button:
+            self.start(preview=False, check_folders=False)
 
     def closeEvent(self, event):
         if self.thread is not None:

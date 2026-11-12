@@ -9,7 +9,7 @@ from tkinter import filedialog, messagebox, ttk
 import copy_core
 
 
-APP_NAME = "Copy Missing Files"
+APP_NAME = "Music Library Backup"
 
 CONFIG_DIR = (
     Path.home()
@@ -47,7 +47,7 @@ class CopyMissingFilesApp:
 
         ttk.Label(
             main,
-            text="Copy Missing Files",
+            text="Music Library Backup",
             font=("Helvetica", 20, "bold"),
         ).pack(anchor="w", pady=(0, 15))
 
@@ -101,7 +101,7 @@ class CopyMissingFilesApp:
 
         self.start_button = ttk.Button(
             main,
-            text="Copy Missing Files",
+            text="Back Up",
             command=self.start_copy,
         )
         self.start_button.pack(fill="x", pady=(5, 10))

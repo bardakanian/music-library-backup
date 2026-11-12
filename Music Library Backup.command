@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Double-click in Finder to launch Copy Missing Files.
+# Double-click in Finder to launch Music Library Backup.
 # On first run it creates the virtual environment and installs PySide6.
 
 set -e
@@ -25,5 +25,5 @@ nohup "$PYTHON" app_qt.py >/dev/null 2>&1 &
 disown
 
 # Close the Terminal window that macOS opened for this script.
-osascript -e 'tell application "Terminal" to close (every window whose name contains "Copy Missing Files.command")' >/dev/null 2>&1 &
+osascript -e 'tell application "Terminal" to close (every window whose name contains "Music Library Backup.command")' >/dev/null 2>&1 &
 exit 0

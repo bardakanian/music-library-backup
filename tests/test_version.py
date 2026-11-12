@@ -31,6 +31,11 @@ class VersionTests(unittest.TestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+        old_patcher = mock.patch.object(
+            app_qt, "OLD_CONFIG_FILE", Path(temp.name) / "old-settings.json"
+        )
+        old_patcher.start()
+        self.addCleanup(old_patcher.stop)
 
     def test_version_is_semantic(self):
         self.assertRegex(app_qt.VERSION, r"^\d+\.\d+\.\d+$")

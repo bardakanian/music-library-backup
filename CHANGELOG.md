@@ -2,6 +2,27 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 2.1.0 — 2026-11-11
+
+- New safety check: when far more files look missing than are already there, the app checks whether the music folder and destination are one folder level apart (for example `~/Music/Music` instead of `Media.localized/Music`, or `Stick` instead of `Stick/Music`), which would copy the whole library a second time. Preview shows a warning; Back Up stops before copying and offers **Use That Folder**, **Back Up Anyway** or Cancel.
+- Long status messages now wrap instead of being cut off.
+
+## 2.0.1 — 2026-11-11
+
+- Fix: on exFAT and FAT drives macOS wrote a hidden `._` file next to every copied file and new folder, which shows up on Windows as broken duplicates (such as `._song.m4a`) that MusicBee may try to import. The app now removes the `._` file of each item it creates, including library backups and playlists. Tested on a real exFAT volume.
+- Fix: a failed or cancelled library backup left an empty dated folder in `Library Backups`.
+- Fix: when two files would get the same Windows name, which one was copied could change between runs; it's now always the same one.
+
+## 2.0.0 — 2026-11-11
+
+- Renamed to **Music Library Backup**, focused on copying an Apple Music library to a USB stick for Windows and on backups. Saved folders from Copy Missing Files carry over; the launcher is now `Music Library Backup.command` and the bundle `Music Library Backup.app`.
+- New **Windows-safe names** option (on by default): replaces characters Windows and exFAT reject, fixes trailing dots/spaces and reserved names, stores names as NFC, copies links as real files, flags paths over 259 characters, and skips files whose Windows names would clash. Copies made under the original names still count as already there.
+- Mac-only clutter (`.DS_Store`, `._*`, `.localized`, `Icon\r`) is no longer copied.
+- New **Back up library database** option: each run saves `Music Library.musiclibrary` in a new dated folder under `Library Backups/`, so earlier backups are never replaced.
+- New **Export playlists (.m3u8)** option: reads playlists from Apple Music and writes them with relative Windows paths for MusicBee, leaving out tracks that aren't files in the music folder.
+- New **Use Apple Music Library** button and an **Eject** button for the destination drive.
+- Preview shows each file's new Windows-safe name; path-length warnings appear under Problems.
+
 ## 1.4.0 — 2026-11-08
 
 - Copy up to 4 files at the same time (PySide6 app). Progress shows the files in flight, and Cancel, a full drive or an unplugged drive stop all of them and remove their partial copies.

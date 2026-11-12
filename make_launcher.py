@@ -1,4 +1,4 @@
-"""Build "Copy Missing Files.app" and install it in the Applications folder.
+"""Build "Music Library Backup.app" and install it in the Applications folder.
 
 The bundle is a small launcher: it runs app_qt.py from this project with
 the project's .venv, so code changes show up without rebuilding. Rebuild
@@ -28,7 +28,7 @@ import app_qt
 PROJECT_DIR = Path(__file__).resolve().parent
 BUILD_DIR = PROJECT_DIR / "build"
 BUNDLE_NAME = app_qt.APP_NAME + ".app"
-BUNDLE_ID = "local.copymissingfiles"
+BUNDLE_ID = "local.musiclibrarybackup"
 EXECUTABLE = "launcher"
 
 LAUNCHER_SCRIPT = """#!/bin/zsh
@@ -38,12 +38,12 @@ PROJECT_DIR={project}
 PYTHON="$PROJECT_DIR/.venv/bin/python"
 
 if [[ ! -f "$PROJECT_DIR/app_qt.py" ]]; then
-    osascript -e 'display alert "Copy Missing Files" message "The project folder was moved or deleted. Run make_launcher.py again from its new location."'
+    osascript -e 'display alert "Music Library Backup" message "The project folder was moved or deleted. Run make_launcher.py again from its new location."'
     exit 1
 fi
 
 if [[ ! -x "$PYTHON" ]] || ! "$PYTHON" -c "import PySide6" 2>/dev/null; then
-    osascript -e 'display alert "Copy Missing Files" message "Open \\"Copy Missing Files.command\\" in the project folder once to set up Python and PySide6."'
+    osascript -e 'display alert "Music Library Backup" message "Open \\"Music Library Backup.command\\" in the project folder once to set up Python and PySide6."'
     exit 1
 fi
 

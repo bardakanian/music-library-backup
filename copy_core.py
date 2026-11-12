@@ -1,13 +1,15 @@
-"""Copy logic shared by the PySide6 app (app_qt.py) and the Tkinter app (main.py).
+"""Backup logic shared by the PySide6 app (app_qt.py) and the Tkinter app (main.py).
 
 Nothing here touches a GUI, so it can run on a worker thread and be tested directly.
 """
 
 import errno
 import hashlib
+import json
 import os
 import shutil
 import stat
+import subprocess
 import threading
 import unicodedata
 from collections import Counter
@@ -25,6 +27,25 @@ CHUNK_SIZE = 4 * 1024 * 1024
 MAX_NAME_BYTES = 255
 
 PARALLEL_COPIES = 4
+
+# Mac-only clutter that would litter a Windows drive.
+JUNK_NAMES = {".DS_Store", ".localized", "Icon\r"}
+JUNK_PREFIXES = ("._", PARTIAL_PREFIX)
+
+WINDOWS_BAD_CHARACTERS = set('<>:"/\\|?*')
+WINDOWS_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM" + str(number) for number in range(1, 10)}
+    | {"LPT" + str(number) for number in range(1, 10)}
+)
+
+# Older Windows apps can't open paths longer than this, drive letter included.
+WINDOWS_MAX_PATH = 259
+
+BACKUPS_FOLDER = "Library Backups"
+PLAYLISTS_FOLDER = "Playlists"
+
+DEFAULT_MUSIC_FOLDER = Path.home() / "Music" / "Music"
 
 
 class Cancelled(Exception):
@@ -48,6 +69,13 @@ class PlanItem:
     relative: Path
     is_symlink: bool
     size: int
+    # Where it goes under the destination; differs from relative when the
+    # name had to be made Windows-safe.
+    target: Path = None
+
+    def __post_init__(self):
+        if self.target is None:
+            self.target = self.relative
 
 
 @dataclass
@@ -55,8 +83,76 @@ class Plan:
     items: list = field(default_factory=list)
     total_bytes: int = 0
     existing: int = 0
+    ignored: int = 0
+    renamed: int = 0
     skipped: list = field(default_factory=list)
     errors: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+
+
+def is_junk(name):
+    return name in JUNK_NAMES or name.startswith(JUNK_PREFIXES)
+
+
+def drop_appledouble(path):
+    """Remove the "._" file macOS just made next to path, if any.
+
+    On exFAT and FAT drives macOS keeps extended attributes in a hidden
+    "._<name>" file beside every file and folder it writes. On Windows these
+    show up as broken copies (MusicBee may try to import "._song.m4a"), so
+    remove the one belonging to an item this app has just created.
+    """
+    path = Path(path)
+
+    try:
+        os.unlink(path.with_name("._" + path.name))
+    except OSError:
+        pass
+
+
+def drop_appledoubles_in(folder):
+    """Remove the "._" files inside a folder tree this app just created."""
+    for root_dir, dir_names, file_names in os.walk(folder):
+        for name in file_names:
+            if name.startswith("._"):
+                try:
+                    os.unlink(os.path.join(root_dir, name))
+                except OSError:
+                    pass
+
+
+def windows_part(name):
+    """Return name as Windows and exFAT will accept it."""
+    name = unicodedata.normalize("NFC", name)
+    cleaned = "".join(
+        "_" if character in WINDOWS_BAD_CHARACTERS or ord(character) < 32
+        else character
+        for character in name
+    )
+
+    # Windows silently drops trailing dots and spaces.
+    cleaned = cleaned.rstrip(" .") or "_"
+
+    if cleaned.split(".")[0].rstrip(" ").upper() in WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned
+
+    return cleaned
+
+
+def windows_relative(relative):
+    return Path(*(windows_part(part) for part in relative.parts))
+
+
+def windows_path_length(destination, target):
+    """Length of the path as Windows would see it, e.g. E:\\Music\\..."""
+    parts = Path(os.path.abspath(destination)).parts
+
+    if len(parts) >= 3 and parts[1] == "Volumes":
+        inside = parts[3:]
+    else:
+        inside = parts[1:]
+
+    return len("E:\\" + "\\".join((*inside, *target.parts)))
 
 
 def is_missing_error(error):
@@ -181,10 +277,28 @@ def check_folders(source_text, destination_text):
     return source, destination
 
 
-def build_plan(source, destination, should_cancel=None, on_scanned=None):
-    """Find the items in source that are missing from destination."""
+def build_plan(
+    source,
+    destination,
+    should_cancel=None,
+    on_scanned=None,
+    windows_safe=False,
+):
+    """Find the items in source that are missing from destination.
+
+    With windows_safe, names are changed so Windows and exFAT accept them,
+    links are copied as the files they point to, and paths too long for
+    Windows are flagged.
+    """
     plan = Plan()
     scanned = 0
+    claimed = {}
+
+    def lstat_or_none(path):
+        try:
+            return os.lstat(path)
+        except FileNotFoundError:
+            return None
 
     def walk_error(error):
         plan.errors.append(
@@ -199,6 +313,7 @@ def build_plan(source, destination, should_cancel=None, on_scanned=None):
             on_scanned(scanned)
 
         relative = source_path.relative_to(source)
+        target = windows_relative(relative) if windows_safe else relative
 
         try:
             source_info = os.lstat(source_path)
@@ -209,13 +324,49 @@ def build_plan(source, destination, should_cancel=None, on_scanned=None):
                 plan.errors.append((relative, error.strerror or str(error)))
             return
 
+        if windows_safe:
+            key = name_key(target)
+
+            if key in claimed:
+                plan.skipped.append((
+                    relative,
+                    "same name on Windows as " + str(claimed[key]),
+                ))
+                return
+
+            claimed[key] = relative
+
         try:
-            destination_info = os.lstat(destination / relative)
-        except FileNotFoundError:
-            destination_info = None
+            destination_info = lstat_or_none(destination / target)
+
+            # Copies made before names were made Windows-safe still count.
+            # exFAT may reject the old name outright instead of not finding it.
+            if destination_info is None and target != relative:
+                try:
+                    destination_info = lstat_or_none(destination / relative)
+                except OSError:
+                    destination_info = None
         except OSError as error:
             plan.errors.append((relative, error.strerror or str(error)))
             return
+
+        if (
+            windows_safe
+            and destination_info is None
+            and stat.S_ISLNK(source_info.st_mode)
+        ):
+            # exFAT can't store links, so copy what the link points to.
+            try:
+                source_info = os.stat(source_path)
+            except OSError:
+                plan.skipped.append((relative, "link to a missing file"))
+                return
+
+            if not stat.S_ISREG(source_info.st_mode):
+                plan.skipped.append(
+                    (relative, "link to a folder (exFAT can't store links)")
+                )
+                return
 
         if destination_info is not None:
             if (
@@ -231,14 +382,30 @@ def build_plan(source, destination, should_cancel=None, on_scanned=None):
             return
 
         if stat.S_ISLNK(source_info.st_mode):
-            plan.items.append(PlanItem(source_path, relative, True, 0))
+            item = PlanItem(source_path, relative, True, 0, target)
         elif stat.S_ISREG(source_info.st_mode):
-            plan.items.append(
-                PlanItem(source_path, relative, False, source_info.st_size)
+            item = PlanItem(
+                source_path, relative, False, source_info.st_size, target
             )
             plan.total_bytes += source_info.st_size
         else:
             plan.skipped.append((relative, "special item"))
+            return
+
+        plan.items.append(item)
+
+        if target != relative:
+            plan.renamed += 1
+
+        if windows_safe:
+            length = windows_path_length(destination, target)
+
+            if length > WINDOWS_MAX_PATH:
+                plan.warnings.append((
+                    target,
+                    f"path is {length} characters; some Windows apps "
+                    f"stop at {WINDOWS_MAX_PATH + 1}",
+                ))
 
     for root_dir, dir_names, file_names in os.walk(
         source,
@@ -253,6 +420,10 @@ def build_plan(source, destination, should_cancel=None, on_scanned=None):
         real_directories = []
 
         for directory_name in dir_names:
+            if is_junk(directory_name):
+                plan.ignored += 1
+                continue
+
             directory_path = root_path / directory_name
 
             # Symlinked folders are copied as links, not followed.
@@ -263,7 +434,11 @@ def build_plan(source, destination, should_cancel=None, on_scanned=None):
 
         dir_names[:] = real_directories
 
-        for file_name in file_names:
+        for file_name in sorted(file_names):
+            if is_junk(file_name):
+                plan.ignored += 1
+                continue
+
             consider(root_path / file_name)
 
     plan.items.sort(key=lambda item: str(item.relative).lower())
@@ -303,6 +478,8 @@ def ensure_parent(destination_root, relative):
             pass
         except FileNotFoundError as error:
             raise DestinationGone(str(destination_root)) from error
+        else:
+            drop_appledouble(folder)
 
     return folder
 
@@ -318,20 +495,21 @@ def name_clash_locks(items):
     case-sensitive source land on the same file. Copied at the same time,
     both would pass the exists check and one would replace the other.
     """
-    counts = Counter(name_key(item.relative) for item in items)
+    counts = Counter(name_key(item.target) for item in items)
     return {key: threading.Lock() for key, count in counts.items() if count > 1}
 
 
 def copy_item(item, destination_root, on_bytes=None, should_cancel=None):
     """Copy one planned item. Returns False if it appeared in the meantime."""
-    ensure_parent(destination_root, item.relative)
-    destination = destination_root / item.relative
+    ensure_parent(destination_root, item.target)
+    destination = destination_root / item.target
 
     if os.path.lexists(destination):
         return False
 
     if item.is_symlink:
         os.symlink(os.readlink(item.source), destination)
+        drop_appledouble(destination)
         return True
 
     temporary = partial_path(destination)
@@ -361,6 +539,7 @@ def copy_item(item, destination_root, on_bytes=None, should_cancel=None):
 
         if os.path.lexists(destination):
             os.unlink(temporary)
+            drop_appledouble(temporary)
             return False
 
         os.rename(temporary, destination)
@@ -370,6 +549,433 @@ def copy_item(item, destination_root, on_bytes=None, should_cancel=None):
             os.unlink(temporary)
         except OSError:
             pass
+        drop_appledouble(temporary)
         raise
 
+    drop_appledouble(destination)
     return True
+
+
+def default_media_folder():
+    """Return Apple Music's default media folder, if it exists."""
+    media = DEFAULT_MUSIC_FOLDER / "Media.localized"
+
+    if not media.is_dir():
+        media = DEFAULT_MUSIC_FOLDER / "Media"
+
+    if (media / "Music").is_dir():
+        return media / "Music"
+
+    return media if media.is_dir() else None
+
+
+def find_music_library(source=None):
+    """Find the Apple Music library database (a .musiclibrary bundle).
+
+    It normally sits next to the Media folder, so look above the source
+    first, then fall back to the default location.
+    """
+    candidates = []
+
+    if source:
+        candidates.extend(Path(source).expanduser().parents)
+
+    candidates.append(DEFAULT_MUSIC_FOLDER)
+
+    for folder in candidates:
+        try:
+            bundles = sorted(folder.glob("*.musiclibrary"))
+        except OSError:
+            continue
+
+        for bundle in bundles:
+            if bundle.is_dir():
+                return bundle
+
+    return None
+
+
+def snapshot_stamp(now):
+    # No colons: Windows and exFAT don't allow them.
+    return now.strftime("%Y-%m-%d %H.%M.%S")
+
+
+def snapshot_folder(destination_root, stamp):
+    """Create a new dated folder under Library Backups.
+
+    It's always a new folder, so an earlier backup is never replaced.
+    """
+    if not destination_root.is_dir():
+        raise DestinationGone(str(destination_root))
+
+    backups = destination_root / BACKUPS_FOLDER
+
+    try:
+        backups.mkdir()
+        drop_appledouble(backups)
+    except FileExistsError:
+        pass
+
+    folder = backups / stamp
+    number = 2
+
+    while True:
+        try:
+            folder.mkdir()
+            drop_appledouble(folder)
+            return folder
+        except FileExistsError:
+            folder = backups / (stamp + f" ({number})")
+            number += 1
+
+
+def copy_tree(source, destination, should_cancel=None):
+    """Copy the folder source to destination, which must not exist yet.
+
+    The copy is written under a temporary name and renamed when complete,
+    so a cancelled or failed backup never looks like a finished one.
+    Returns the number of bytes copied.
+    """
+    temporary = partial_path(destination)
+    copied = 0
+
+    try:
+        for root_dir, dir_names, file_names in os.walk(source):
+            if should_cancel is not None and should_cancel():
+                raise Cancelled()
+
+            root_path = Path(root_dir)
+            target_root = temporary / root_path.relative_to(source)
+            target_root.mkdir(exist_ok=True)
+
+            dir_names[:] = [name for name in dir_names if not is_junk(name)]
+
+            for file_name in file_names:
+                if is_junk(file_name):
+                    continue
+
+                source_file = root_path / file_name
+
+                if os.path.islink(source_file):
+                    continue
+
+                shutil.copyfile(source_file, target_root / file_name)
+                copied += os.path.getsize(source_file)
+
+        os.rename(temporary, destination)
+
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        drop_appledouble(temporary)
+        raise
+
+    drop_appledouble(destination)
+    drop_appledoubles_in(destination)
+    return copied
+
+
+# Reads every ordinary playlist from Apple Music as JSON:
+# [{"name": ..., "tracks": [posix path or null, ...]}, ...]
+PLAYLISTS_SCRIPT = """
+function run() {
+    var music = Application("Music");
+    var lists = music.userPlaylists();
+    var result = [];
+
+    for (var i = 0; i < lists.length; i++) {
+        var list = lists[i];
+
+        if (list.specialKind() !== "none") {
+            continue;
+        }
+
+        var locations = [];
+
+        try {
+            locations = list.fileTracks.location();
+        } catch (error) {}
+
+        result.push({
+            name: list.name(),
+            tracks: locations.map(function (location) {
+                return location ? location.toString() : null;
+            })
+        });
+    }
+
+    return JSON.stringify(result);
+}
+"""
+
+
+class PlaylistError(Exception):
+    pass
+
+
+def run_cancellable(command, should_cancel=None, timeout=600):
+    """Run command, killing it if should_cancel() turns true."""
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    waited = 0.0
+
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.25)
+            return process.returncode, stdout, stderr
+        except subprocess.TimeoutExpired:
+            waited += 0.25
+
+            if should_cancel is not None and should_cancel():
+                process.kill()
+                process.communicate()
+                raise Cancelled()
+
+            if waited >= timeout:
+                process.kill()
+                process.communicate()
+                raise
+
+
+def read_playlists(should_cancel=None, timeout=600):
+    """Ask Apple Music for its playlists. Returns [(name, [Path or None])]."""
+    try:
+        returncode, stdout, stderr = run_cancellable(
+            ["osascript", "-l", "JavaScript", "-e", PLAYLISTS_SCRIPT],
+            should_cancel,
+            timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise PlaylistError("Apple Music didn't answer: " + str(error))
+
+    if returncode != 0:
+        message = stderr.strip()
+
+        if "-1743" in message:
+            raise PlaylistError(
+                "Not allowed to read Apple Music playlists. Allow it in "
+                "System Settings → Privacy & Security → Automation, "
+                "then try again."
+            )
+
+        raise PlaylistError("Apple Music couldn't list playlists: " + message)
+
+    try:
+        data = json.loads(stdout)
+    except ValueError as error:
+        raise PlaylistError("Unexpected answer from Apple Music.") from error
+
+    return [
+        (
+            str(entry.get("name") or "Untitled"),
+            [Path(track) if track else None for track in entry.get("tracks", [])],
+        )
+        for entry in data
+    ]
+
+
+def relative_to_source(track, source):
+    for base in (source, source.resolve()):
+        for path in (track, track.resolve()):
+            try:
+                return path.relative_to(base)
+            except ValueError:
+                pass
+
+    return None
+
+
+def write_playlists(
+    playlists,
+    source,
+    destination_root,
+    folder,
+    windows_safe=False,
+):
+    """Write each playlist as an .m3u8 file inside folder.
+
+    Paths are relative to the playlist file, with Windows backslashes, so
+    they keep working whatever drive letter the stick gets. Tracks that
+    aren't in the source folder or weren't copied are left out.
+    Returns (playlists written, tracks written, tracks left out).
+    """
+    folder.mkdir()
+    drop_appledouble(folder)
+    used = set()
+    written = tracks_written = left_out = 0
+
+    for name, tracks in playlists:
+        lines = ["#EXTM3U"]
+
+        for track in tracks:
+            relative = None if track is None else relative_to_source(track, source)
+
+            if relative is None:
+                left_out += 1
+                continue
+
+            target = windows_relative(relative) if windows_safe else relative
+            on_destination = destination_root / target
+
+            if not on_destination.exists() and target != relative:
+                on_destination = destination_root / relative
+
+            if not on_destination.exists():
+                left_out += 1
+                continue
+
+            lines.append(
+                os.path.relpath(on_destination, folder).replace(os.sep, "\\")
+            )
+            tracks_written += 1
+
+        file_name = windows_part(name)
+        candidate = file_name
+        number = 2
+
+        while candidate.casefold() in used:
+            candidate = file_name + f" ({number})"
+            number += 1
+
+        used.add(candidate.casefold())
+
+        playlist = folder / (candidate + ".m3u8")
+
+        with open(playlist, "w", encoding="utf-8") as file:
+            file.write("\r\n".join(lines) + "\r\n")
+
+        drop_appledouble(playlist)
+
+        written += 1
+
+    return written, tracks_written, left_out
+
+
+def volume_of(path):
+    """Return /Volumes/<name> for a path on an external drive, else None."""
+    parts = Path(os.path.abspath(path)).parts
+
+    if len(parts) >= 3 and parts[1] == "Volumes":
+        volume = Path(*parts[:3])
+
+        if os.path.ismount(volume) and not os.path.islink(volume):
+            return volume
+
+    return None
+
+
+def music_is_running():
+    try:
+        return subprocess.run(
+            ["pgrep", "-x", "Music"], capture_output=True
+        ).returncode == 0
+    except OSError:
+        return False
+
+
+# Only look one level further into folders with this few subfolders, so a
+# drive full of artist folders isn't scanned twice.
+MATCH_MAX_SUBFOLDERS = 20
+MATCH_MIN_SHARED = 3
+
+
+def child_keys(folder):
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return set()
+
+    return {
+        name_key(Path(windows_part(name)))
+        for name in names
+        if not is_junk(name) and name != BACKUPS_FOLDER
+    }
+
+
+def nearby_folders(root):
+    """Subfolders of root, and theirs, as long as there are only a few."""
+    found = []
+    level = [root]
+
+    for _depth in range(2):
+        next_level = []
+
+        for folder in level:
+            try:
+                subfolders = [
+                    entry.path for entry in os.scandir(folder)
+                    if entry.is_dir(follow_symlinks=False)
+                    and not is_junk(entry.name)
+                    and entry.name != BACKUPS_FOLDER
+                ]
+            except OSError:
+                continue
+
+            if len(subfolders) > MATCH_MAX_SUBFOLDERS:
+                continue
+
+            next_level.extend(Path(path) for path in subfolders)
+
+        found.extend(next_level)
+        level = next_level
+
+    return found
+
+
+def better_folder_match(source, destination):
+    """Spot a destination that holds this music one level up or down.
+
+    For example the music was backed up to "Stick/Music" but the
+    destination is now "Stick", or the music folder is now "~/Music/Music"
+    instead of ".../Media.localized/Music". Every path then differs, so the
+    whole library would be copied again. Returns None, or a dict with
+    "role" ("source" or "destination"), "path" and "message".
+    """
+    source_keys = child_keys(source)
+    destination_keys = child_keys(destination)
+
+    if not source_keys:
+        return None
+
+    current = len(source_keys & destination_keys)
+    best = None
+
+    for folder in nearby_folders(destination):
+        shared = len(source_keys & child_keys(folder))
+
+        if best is None or shared > best[0]:
+            best = (shared, "destination", folder)
+
+    for folder in nearby_folders(source):
+        folder_keys = child_keys(folder)
+        shared = len(folder_keys & destination_keys)
+
+        if best is None or shared > best[0]:
+            best = (shared, "source", folder)
+
+    if best is None:
+        return None
+
+    shared, role, folder = best
+
+    if shared < MATCH_MIN_SHARED or shared <= current * 2:
+        return None
+
+    if role == "destination":
+        message = (
+            "\"" + str(folder) + "\" already has " + f"{shared:,}"
+            + " of the same folders as your music folder. Choose it as the "
+            "destination, or this backup will copy your music a second time."
+        )
+    else:
+        message = (
+            "The destination matches \"" + str(folder) + "\" inside your "
+            "music folder (" + f"{shared:,}" + " of the same folders). Choose "
+            "it as the music folder, or this backup will copy your music a "
+            "second time."
+        )
+
+    return {"role": role, "path": str(folder), "message": message}
