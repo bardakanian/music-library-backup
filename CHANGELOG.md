@@ -2,6 +2,10 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 2.3.1 — 2026-11-13
+
+- Fix: in an import, choosing the folder above the backup (for example `MUSIC BACKUP` instead of `MUSIC BACKUP\Music`) said "No Library Backups folder here" even though one sat inside. The music would also have been copied into an extra `Music` folder and the playlists missed. The app now switches to the folder that holds `Library Backups` (up to two levels down, also for automatic detection) and says so in the log.
+
 ## 2.3.0 — 2026-11-13
 
 - New **Sync edits** option (on by default). Editing a song in Apple Music rewrites the file and often moves it to a new Artist/Album folder, which left the old copy on the drive and either skipped the edit or copied the song twice. Now:

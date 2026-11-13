@@ -58,7 +58,7 @@ from copy_core import format_size
 APP_NAME = "Music Library Backup"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -1556,6 +1556,7 @@ class MainWindow(QMainWindow):
         ):
             widget.setVisible(backup)
 
+        self.adopt_inner_backup()
         self.detect_button.setVisible(not backup)
         self.musicbee_box.setVisible(not backup)
         self.show_idle()
@@ -1640,7 +1641,30 @@ class MainWindow(QMainWindow):
 
         super().changeEvent(event)
 
+    def adopt_inner_backup(self):
+        """Use the folder that holds Library Backups if the source is above it.
+
+        The source is often chosen one level too high (the stick's backup
+        folder instead of the Music folder inside it). Importing from there
+        would nest the music one folder deeper and hide the playlists.
+        """
+        source = self.source_field.text()
+
+        if self.mode != MODE_IMPORT or not source or not Path(source).is_dir():
+            return
+
+        inner = copy_core.find_backup_folder(source)
+
+        if inner is not None and inner != Path(source):
+            self.source_field.set_text(str(inner))
+            self.append_log([(
+                "info",
+                "Using " + str(inner) + ", the folder that holds "
+                + copy_core.BACKUPS_FOLDER + ".",
+            )])
+
     def on_folders_changed(self):
+        self.adopt_inner_backup()
         self.save_settings()
         self.show_idle()
         self.update_options()

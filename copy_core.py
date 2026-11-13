@@ -1296,6 +1296,24 @@ def list_drive_roots():
     return roots
 
 
+def subfolders(folder, limit=100):
+    """Up to limit subfolders of a folder, so a huge folder isn't listed in full."""
+    found = []
+
+    try:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if len(found) >= limit:
+                    break
+
+                if entry.is_dir(follow_symlinks=False) and not is_junk(entry.name):
+                    found.append(Path(entry.path))
+    except OSError:
+        pass
+
+    return sorted(found, key=lambda path: path.name.casefold())
+
+
 def find_backup_folder(root, loose=False):
     """Find the music folder a Music Library Backup left on a drive.
 
@@ -1326,6 +1344,15 @@ def find_backup_folder(root, loose=False):
                 return child
         except OSError:
             continue
+
+    # One level deeper, for a drive that holds e.g. "MUSIC BACKUP\Music".
+    for child in children:
+        for grandchild in subfolders(child):
+            try:
+                if (grandchild / BACKUPS_FOLDER).is_dir():
+                    return grandchild
+            except OSError:
+                continue
 
     if loose:
         for child in children:

@@ -42,6 +42,18 @@ class FindBackupTests(unittest.TestCase):
             self.root / "music",
         )
 
+    def test_backup_two_levels_down_is_found(self):
+        write(self.root / "MUSIC BACKUP" / "Music" / "Library Backups" / "d" / "x.txt")
+        write(self.root / "MUSIC BACKUP" / "Music" / "Artist" / "a.m4a")
+        self.assertEqual(
+            copy_core.find_backup_folder(self.root),
+            self.root / "MUSIC BACKUP" / "Music",
+        )
+        self.assertEqual(
+            copy_core.find_backup_folder(self.root / "MUSIC BACKUP"),
+            self.root / "MUSIC BACKUP" / "Music",
+        )
+
     def test_nothing_found(self):
         write(self.root / "Photos" / "a.jpg")
         self.assertIsNone(copy_core.find_backup_folder(self.root))
@@ -113,6 +125,28 @@ class ImportWindowTests(unittest.TestCase):
             again.run()
             self.assertEqual(results[-1]["to_copy"], 0)
 
+    def test_source_one_level_too_high_is_corrected(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+
+        for name, file in (("CONFIG_FILE", "new.json"), ("OLD_CONFIG_FILE", "old.json")):
+            patcher = unittest.mock.patch.object(app_qt, name, Path(temp.name) / file)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        stick = Path(temp.name) / "MUSIC BACKUP"
+        write(stick / "Music" / "Library Backups" / "d" / "x.txt")
+        write(stick / "Music" / "Artist" / "a.m4a")
+
+        window = app_qt.MainWindow()
+        self.addCleanup(window.close)
+        window.apply_mode(app_qt.MODE_IMPORT)
+        window.source_field.set_text(str(stick))
+        window.on_folders_changed()
+
+        self.assertEqual(Path(window.source_field.text()), stick / "Music")
+        self.assertIn("Music Library Backup found", window.source_field.info_label.text())
+
     def test_mode_switch_keeps_each_modes_folders(self):
         # Never touch the real settings file: closing a window saves it.
         temp = tempfile.TemporaryDirectory()
@@ -125,6 +159,11 @@ class ImportWindowTests(unittest.TestCase):
 
         window = app_qt.MainWindow()
         self.addCleanup(window.close)
+        # No real drive may be picked up in place of the made-up stick path.
+        patcher = unittest.mock.patch.object(copy_core, "find_backup_drives", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         window.folders = {
             app_qt.MODE_BACKUP: ["/music", "/stick"],
             app_qt.MODE_IMPORT: ["/stick2", "/pc"],
