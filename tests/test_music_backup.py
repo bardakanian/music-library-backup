@@ -431,3 +431,128 @@ class FolderMismatchTests(unittest.TestCase):
 
         self.assertEqual(stats["phase"], "done")
         self.assertEqual(stats["copied"], 4)
+
+
+def write_bytes(path, size, fill=b"a"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(fill * size)
+
+
+class SyncEditsTests(unittest.TestCase):
+    """Songs edited in Apple Music change size and sometimes move folders."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.source = root / "Music"
+        self.destination = root / "stick" / "Music"
+
+        # Unchanged song.
+        write_bytes(self.source / "Band" / "Album" / "01 Same.mp3", 500_000)
+        write_bytes(self.destination / "Band" / "Album" / "01 Same.mp3", 500_000)
+
+        # Edited in place: new tags, slightly bigger.
+        write_bytes(self.source / "Band" / "Album" / "02 Edited.mp3", 600_400, b"n")
+        write_bytes(self.destination / "Band" / "Album" / "02 Edited.mp3", 600_000, b"o")
+
+        # Moved: artist, album and title filled in, so a new folder and name.
+        write_bytes(self.source / "Coldplay" / "Parachutes" / "01 Dont Panic.mp3", 1_004_000, b"n")
+        write_bytes(self.destination / "Unknown Artist" / "Unknown Album" / "01 Track 1.mp3", 1_000_000, b"o")
+        (self.destination / "Unknown Artist" / "Unknown Album" / ".DS_Store").write_bytes(b"x")
+
+        # Deleted from the library: only listed.
+        write_bytes(self.destination / "Old" / "Gone" / "07 Bye.mp3", 300_000)
+
+        # A brand new song of a similar size must not steal a match.
+        write_bytes(self.source / "New" / "Single" / "05 Fresh.m4a", 1_002_000)
+
+    def run_worker(self, preview=False, sync=True):
+        worker = app_qt.CopyWorker(
+            self.source, self.destination, preview,
+            windows_safe=True, sync=sync,
+        )
+        results = []
+        worker.finished.connect(results.append)
+        worker.run()
+        return results[0]
+
+    def replaced(self, stats):
+        return Path(stats["snapshot"]) / "Replaced"
+
+    def test_preview_lists_edits_and_changes_nothing(self):
+        stats = self.run_worker(preview=True)
+
+        self.assertEqual((stats["updated"], stats["moved"], stats["removed"]), (1, 1, 1))
+        self.assertEqual(stats["snapshot"], "")
+        self.assertTrue((self.destination / "Unknown Artist").exists())
+        self.assertEqual((self.destination / "Band" / "Album" / "02 Edited.mp3").read_bytes()[:1], b"o")
+
+    def test_backup_keeps_new_versions_and_sets_old_ones_aside(self):
+        stats = self.run_worker()
+
+        self.assertEqual(stats["phase"], "done")
+        self.assertEqual(stats["failed"], 0)
+        self.assertEqual(stats["copied"], 3)
+
+        edited = self.destination / "Band" / "Album" / "02 Edited.mp3"
+        self.assertEqual(edited.read_bytes()[:1], b"n")
+        self.assertTrue((self.destination / "Coldplay" / "Parachutes" / "01 Dont Panic.mp3").is_file())
+
+        replaced = self.replaced(stats)
+        self.assertEqual((replaced / "Band" / "Album" / "02 Edited.mp3").read_bytes()[:1], b"o")
+        self.assertTrue((replaced / "Unknown Artist" / "Unknown Album" / "01 Track 1.mp3").is_file())
+
+        # The emptied old folders are gone; the deleted song is untouched.
+        self.assertFalse((self.destination / "Unknown Artist").exists())
+        self.assertTrue((self.destination / "Old" / "Gone" / "07 Bye.mp3").is_file())
+
+        # A second run finds nothing to do.
+        again = self.run_worker()
+        self.assertEqual((again["copied"], again["updated"], again["moved"]), (0, 0, 0))
+        self.assertEqual(again["removed"], 1)
+
+    def test_without_sync_nothing_is_replaced(self):
+        stats = self.run_worker(sync=False)
+
+        self.assertEqual(stats["updated"], 0)
+        self.assertEqual((self.destination / "Band" / "Album" / "02 Edited.mp3").read_bytes()[:1], b"o")
+        self.assertTrue((self.destination / "Unknown Artist" / "Unknown Album" / "01 Track 1.mp3").is_file())
+
+    def test_leftover_old_copy_of_a_song_already_there_is_set_aside(self):
+        # An earlier backup copied the edited song; the old copy stayed.
+        write_bytes(self.source / "Demo Artist" / "Unknown Album" / "Night Ride.mp3", 4_842_000)
+        write_bytes(self.destination / "Demo Artist" / "Unknown Album" / "Night Ride.mp3", 4_842_000)
+        write_bytes(
+            self.destination / "Old Artist" / "Unknown Album" / "Night Ride _ Official Video.mp3",
+            4_842_000,
+        )
+
+        stats = self.run_worker()
+
+        self.assertEqual(stats["duplicates"], 1)
+        self.assertFalse((self.destination / "Old Artist").exists())
+        self.assertTrue((self.destination / "Demo Artist" / "Unknown Album" / "Night Ride.mp3").is_file())
+        self.assertTrue(
+            (self.replaced(stats) / "Old Artist" / "Unknown Album" / "Night Ride _ Official Video.mp3").is_file()
+        )
+
+    def test_different_song_of_the_same_size_is_not_a_duplicate(self):
+        write_bytes(self.source / "A" / "B" / "Hello.mp3", 4_000_000)
+        write_bytes(self.destination / "A" / "B" / "Hello.mp3", 4_000_000)
+        write_bytes(self.destination / "C" / "D" / "Goodbye.mp3", 4_000_000)
+
+        stats = self.run_worker(preview=True)
+
+        self.assertEqual(stats["duplicates"], 0)
+        self.assertEqual(stats["removed"], 2)
+
+    def test_track_number_and_title_helpers(self):
+        self.assertEqual(copy_core.track_number("03 Song.m4a"), 3)
+        self.assertEqual(copy_core.track_number("1-03 Song.m4a"), 1)
+        self.assertIsNone(copy_core.track_number("Song.m4a"))
+        self.assertEqual(copy_core.title_key("03 Song?.m4a"), copy_core.title_key("Song_.mp3"))

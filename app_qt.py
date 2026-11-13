@@ -58,7 +58,7 @@ from copy_core import format_size
 APP_NAME = "Music Library Backup"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "2.2.2"
+VERSION = "2.3.0"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -102,6 +102,8 @@ LOG_PREFIXES = {
     "skipped": "– ",
     "warning": "⚠ ",
     "error": "✕ ",
+    "update": "↻ ",
+    "removed": "○ ",
 }
 
 LOG_FILTERS = [
@@ -109,6 +111,7 @@ LOG_FILTERS = [
     ("Copied", {"copied"}),
     ("To copy", {"missing"}),
     ("Problems", {"skipped", "warning", "error"}),
+    ("Edits & removals", {"update", "removed"}),
 ]
 
 
@@ -305,6 +308,7 @@ class CopyWorker(QObject):
         library=None,
         export_playlists=False,
         check_folders=True,
+        sync=False,
     ):
         super().__init__()
         self.source = source
@@ -314,6 +318,8 @@ class CopyWorker(QObject):
         self.library = library
         self.export_playlists = export_playlists
         self.check_folders = check_folders
+        self.sync = sync
+        self.snapshot = None
         self.cancel_requested = False
 
         self.pending_log = []
@@ -345,6 +351,10 @@ class CopyWorker(QObject):
             "warnings": 0,
             "snapshot": "",
             "mismatch": None,
+            "updated": 0,
+            "moved": 0,
+            "removed": 0,
+            "duplicates": 0,
         }
 
     def cancel(self):
@@ -399,6 +409,7 @@ class CopyWorker(QObject):
                 self.is_cancelled,
                 self.on_scanned,
                 self.windows_safe,
+                self.sync,
             )
             self.record_plan(plan)
             mismatch = None
@@ -414,6 +425,12 @@ class CopyWorker(QObject):
                 stats["mismatch"] = mismatch
                 stats["warnings"] += 1
                 self.add_log("warning", mismatch["message"])
+
+            if self.sync and mismatch is None:
+                copy_core.find_moved_and_removed(
+                    plan, self.destination, self.is_cancelled
+                )
+                self.record_sync(plan)
 
             if mismatch is not None and not self.preview:
                 stats["phase"] = "mismatch"
@@ -493,6 +510,125 @@ class CopyWorker(QObject):
 
         self.add_log("info", summary)
 
+    def record_sync(self, plan):
+        stats = self.stats
+        stats["updated"] = len(plan.changed)
+        stats["moved"] = len(plan.moved)
+        stats["removed"] = len(plan.removed)
+        stats["duplicates"] = len(plan.duplicates)
+        stats["to_copy"] += len(plan.changed)
+
+        for item in plan.changed:
+            self.add_log(
+                "update",
+                str(item.target) + " — edited; new version copied, old one set aside",
+            )
+
+        for item in plan.moved:
+            self.add_log(
+                "update",
+                str(item.target) + " — moved from " + str(item.replaces),
+            )
+
+        for relative, item in plan.duplicates:
+            self.add_log(
+                "update",
+                str(relative) + " — old copy of " + str(item.target)
+                + ", which is already there; set aside",
+            )
+
+        for relative in plan.removed:
+            self.add_log(
+                "removed",
+                str(relative) + " — no longer in your music folder (left as is)",
+            )
+
+        if plan.changed or plan.moved or plan.duplicates or plan.removed:
+            self.add_log(
+                "info",
+                plural(len(plan.changed), "edited song")
+                + ", " + plural(len(plan.moved), "moved song")
+                + ", " + plural(len(plan.duplicates), "leftover duplicate")
+                + ", " + f"{len(plan.removed):,}"
+                + " no longer in your library. Old versions go to "
+                + copy_core.BACKUPS_FOLDER + ", not deleted.",
+            )
+
+        # Edited songs are copied again after their old version is set aside.
+        plan.items = sorted(
+            plan.items + plan.changed,
+            key=lambda item: str(item.relative).lower(),
+        )
+
+    def get_snapshot(self):
+        """This run's dated folder in Library Backups, made on first use."""
+        if self.snapshot is None:
+            if not self.destination.exists():
+                self.destination.mkdir()
+                copy_core.drop_appledouble(self.destination)
+
+            self.snapshot = copy_core.snapshot_folder(
+                self.destination,
+                copy_core.snapshot_stamp(datetime.now()),
+            )
+            self.stats["snapshot"] = str(self.snapshot)
+
+        return self.snapshot
+
+    def set_aside_old_versions(self, plan):
+        """Move old versions of edited and moved songs into Replaced.
+
+        Returns the items still to copy; an item whose old version couldn't
+        be moved is left out so nothing is overwritten.
+        """
+        if not plan.duplicates and not any(
+            item.replaces is not None for item in plan.items
+        ):
+            return plan.items
+
+        folder = self.get_snapshot() / "Replaced"
+
+        try:
+            folder.mkdir()
+            copy_core.drop_appledouble(folder)
+        except FileExistsError:
+            pass
+
+        for relative, item in plan.duplicates:
+            try:
+                copy_core.set_aside(self.destination, relative, folder)
+            except (copy_core.DestinationGone, OSError) as error:
+                self.stats["failed"] += 1
+                self.add_log(
+                    "error",
+                    "Could not set aside " + str(relative) + " — "
+                    + (getattr(error, "strerror", None) or str(error)),
+                )
+
+        remaining = []
+
+        for item in plan.items:
+            if item.replaces is None:
+                remaining.append(item)
+                continue
+
+            try:
+                copy_core.set_aside(self.destination, item.replaces, folder)
+            except (copy_core.DestinationGone, OSError) as error:
+                self.stats["failed"] += 1
+                self.stats["to_copy"] -= 1
+                self.stats["total_bytes"] -= item.size
+                self.add_log(
+                    "error",
+                    "Could not set aside " + str(item.replaces) + " — "
+                    + (getattr(error, "strerror", None) or str(error)),
+                )
+                continue
+
+            remaining.append(item)
+
+        return remaining
+
     def describe_library_backup(self):
         if self.library is not None:
             self.add_log(
@@ -515,14 +651,7 @@ class CopyWorker(QObject):
         self.emit_progress(force=True)
 
         try:
-            if not self.destination.exists():
-                self.destination.mkdir()
-                copy_core.drop_appledouble(self.destination)
-
-            folder = copy_core.snapshot_folder(
-                self.destination,
-                copy_core.snapshot_stamp(datetime.now()),
-            )
+            folder = self.get_snapshot()
         except copy_core.DestinationGone:
             self.stop_once(
                 "The destination folder is no longer available. "
@@ -652,13 +781,19 @@ class CopyWorker(QObject):
             )
             return
 
-        if not plan.items:
+        if not plan.items and not plan.duplicates:
             return
 
         if not self.destination.exists():
             self.destination.mkdir()
             copy_core.drop_appledouble(self.destination)
             self.add_log("info", "Created " + str(self.destination))
+
+        if self.sync:
+            plan.items = self.set_aside_old_versions(plan)
+
+        if not plan.items:
+            return
 
         stats["phase"] = "copying"
         self.copy_started = time.monotonic()
@@ -1154,6 +1289,14 @@ class MainWindow(QMainWindow):
             "counts, playlists) in Library Backups. Earlier copies are kept."
         )
 
+        self.sync_box = QCheckBox("Sync edits")
+        self.sync_box.setToolTip(
+            "When you edit a song in Apple Music, copy the new version and\n"
+            "move the old one (or the copy left at its old folder) into\n"
+            "Library Backups/<date>/Replaced instead of keeping both.\n"
+            "Songs no longer in your library are only listed."
+        )
+
         self.playlists_box = QCheckBox("Export playlists (.m3u8)")
         self.playlists_box.setToolTip(
             "Saves each Apple Music playlist as an .m3u8 file that MusicBee\n"
@@ -1172,6 +1315,7 @@ class MainWindow(QMainWindow):
             self.database_box,
             self.playlists_box,
             self.musicbee_box,
+            self.sync_box,
         ):
             box.setChecked(True)
             box.toggled.connect(lambda _checked: self.save_settings())
@@ -1374,8 +1518,8 @@ class MainWindow(QMainWindow):
             )
             self.subtitle.setText(
                 "Copies your Apple Music library to a USB stick or backup "
-                "drive. It only adds what's missing; nothing there is ever "
-                "overwritten or deleted."
+                "drive. It adds what's missing; old versions of edited songs "
+                "are set aside, never deleted."
             )
             self.start_button.setText("Back Up")
             self.hint.setText("Tip: Preview shows what's missing without copying.")
@@ -1405,6 +1549,7 @@ class MainWindow(QMainWindow):
 
         for widget in (
             self.windows_box,
+            self.sync_box,
             self.database_box,
             self.playlists_box,
             self.music_button,
@@ -1610,6 +1755,7 @@ class MainWindow(QMainWindow):
     def option_boxes(self):
         return {
             "windows_safe": self.windows_box,
+            "sync_edits": self.sync_box,
             "back_up_database": self.database_box,
             "export_playlists": self.playlists_box,
             "add_to_musicbee": self.musicbee_box,
@@ -1741,6 +1887,7 @@ class MainWindow(QMainWindow):
             self.music_button,
             self.detect_button,
             self.musicbee_box,
+            self.sync_box,
         ):
             box.setEnabled(not running)
 
@@ -1798,6 +1945,9 @@ class MainWindow(QMainWindow):
             library=library,
             export_playlists=not importing and self.playlists_box.isChecked(),
             check_folders=check_folders,
+            # Sync only on the backup drive: a computer's own music folder
+            # may hold songs that never came from the stick.
+            sync=not importing and self.sync_box.isChecked() and check_folders,
         )
         self.worker.moveToThread(self.thread)
 
@@ -1905,6 +2055,20 @@ class MainWindow(QMainWindow):
                 + problem_text
             )
 
+            edits = [
+                f"{count:,} " + text
+                for count, text in (
+                    (stats["updated"], "edited"),
+                    (stats["moved"], "moved"),
+                    (stats["duplicates"], "leftover duplicates"),
+                    (stats["removed"], "no longer in your library"),
+                )
+                if count
+            ]
+
+            if edits:
+                detail += " · " + ", ".join(edits) + " — choose Edits & removals below"
+
             if stats["mismatch"]:
                 detail = "Check your folders: " + stats["mismatch"]["message"]
             self.progress_bar.setValue(0)
@@ -1916,6 +2080,15 @@ class MainWindow(QMainWindow):
                 else "Copied " + plural(stats["copied"], "file")
             )
             detail = format_size(stats["copied_bytes"]) + " copied" + problem_text
+
+            if stats["updated"] or stats["moved"] or stats["duplicates"]:
+                detail += (
+                    " · " + plural(
+                        stats["updated"] + stats["moved"] + stats["duplicates"],
+                        "old version",
+                    )
+                    + " set aside"
+                )
 
             if stats["snapshot"]:
                 detail += " · library backup in " + Path(stats["snapshot"]).name

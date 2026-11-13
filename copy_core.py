@@ -76,6 +76,9 @@ class PlanItem:
     # Where it goes under the destination; differs from relative when the
     # name had to be made Windows-safe.
     target: Path = None
+    # With sync: the old version on the destination (relative path) that is
+    # set aside before this item is copied.
+    replaces: Path = None
 
     def __post_init__(self):
         if self.target is None:
@@ -92,6 +95,19 @@ class Plan:
     skipped: list = field(default_factory=list)
     errors: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    # Keys of destination paths that belong to a source file.
+    matched: set = field(default_factory=set)
+    # With sync: [PlanItem] whose destination copy differs and is replaced,
+    # [PlanItem] new paths matched to an old copy that moved, and
+    # [Path] destination files no longer in the source.
+    changed: list = field(default_factory=list)
+    moved: list = field(default_factory=list)
+    removed: list = field(default_factory=list)
+    # Songs already on the destination, as PlanItems whose target is the
+    # path found there; and [(old copy, PlanItem)] leftover duplicates of
+    # them that an earlier backup copied before the song was edited.
+    present: list = field(default_factory=list)
+    duplicates: list = field(default_factory=list)
 
 
 def is_junk(name):
@@ -287,6 +303,7 @@ def build_plan(
     should_cancel=None,
     on_scanned=None,
     windows_safe=False,
+    sync=False,
 ):
     """Find the items in source that are missing from destination.
 
@@ -341,11 +358,13 @@ def build_plan(
             claimed[key] = relative
 
         try:
+            found = target
             destination_info = lstat_or_none(destination / target)
 
             # Copies made before names were made Windows-safe still count.
             # exFAT may reject the old name outright instead of not finding it.
             if destination_info is None and target != relative:
+                found = relative
                 try:
                     destination_info = lstat_or_none(destination / relative)
                 except OSError:
@@ -373,16 +392,30 @@ def build_plan(
                 return
 
         if destination_info is not None:
+            plan.matched.add(name_key(found))
+
             if (
                 stat.S_ISREG(source_info.st_mode)
                 and stat.S_ISREG(destination_info.st_mode)
                 and source_info.st_size != destination_info.st_size
             ):
-                plan.skipped.append(
-                    (relative, "a different version is already there")
-                )
+                if sync:
+                    plan.changed.append(PlanItem(
+                        source_path, relative, False, source_info.st_size,
+                        target, found,
+                    ))
+                    plan.total_bytes += source_info.st_size
+                else:
+                    plan.skipped.append(
+                        (relative, "a different version is already there")
+                    )
             else:
                 plan.existing += 1
+
+                if sync and stat.S_ISREG(source_info.st_mode):
+                    plan.present.append(PlanItem(
+                        source_path, relative, False, source_info.st_size, found,
+                    ))
             return
 
         if stat.S_ISLNK(source_info.st_mode):
@@ -447,6 +480,226 @@ def build_plan(
 
     plan.items.sort(key=lambda item: str(item.relative).lower())
     return plan
+
+
+# A song whose details were edited is rewritten with new tags, so its size
+# changes a little. Old and new copies count as the same song within this.
+MOVED_SIZE_TOLERANCE = 0.05
+MOVED_MIN_BYTES = 256 * 1024
+MAX_DUPLICATE_CHECKS = 2000
+
+
+def track_number(name):
+    """Leading track number of a file name such as "03 Song.m4a"."""
+    digits = ""
+
+    for character in name:
+        if character.isdigit():
+            digits += character
+        elif digits and character in " -._":
+            break
+        else:
+            return None
+
+    return int(digits) if digits else None
+
+
+def title_key(name):
+    """File name without track number or extension, for matching."""
+    stem = Path(name).stem
+    number = track_number(stem)
+
+    if number is not None:
+        stem = stem.lstrip("0123456789").lstrip(" -._")
+
+    return name_key(Path(windows_part(stem)))
+
+
+def same_song(old_path, old_size, item, require_title=False):
+    """Score how likely the destination file old_path is item before an edit.
+
+    The size must be close and the names must agree (same or shortened title,
+    or same track number); size alone never counts. With require_title, a
+    track number alone isn't enough either.
+    """
+    if old_path.suffix.lower() != item.relative.suffix.lower():
+        return 0
+
+    tolerance = max(MOVED_MIN_BYTES, item.size * MOVED_SIZE_TOLERANCE)
+
+    if abs(old_size - item.size) > tolerance:
+        return 0
+
+    score = 0
+    old_title = title_key(old_path.name)
+    new_title = title_key(item.relative.name)
+
+    if old_title == new_title:
+        score += 2
+    elif min(len(old_title), len(new_title)) >= 4 and (
+        old_title in new_title or new_title in old_title
+    ):
+        # A title cut down or extended, e.g. "Song _ Official Video" → "Song".
+        score += 1
+
+    title_score = score
+    old_number = track_number(old_path.name)
+
+    if old_number is not None and old_number == track_number(item.relative.name):
+        score += 1
+
+    if score == 0 or (require_title and title_score == 0):
+        return 0
+
+    if abs(old_size - item.size) <= item.size * 0.01:
+        score += 1
+
+    if old_size == item.size:
+        score += 1
+
+    return score
+
+
+def best_match(candidates, relative, size, require_title=False):
+    """Index and score of the candidate PlanItem most like this old copy."""
+    best = None
+
+    for index, item in enumerate(candidates):
+        score = same_song(relative, size, item, require_title)
+
+        if score >= 2 and (best is None or score > best[0]):
+            best = (score, index)
+
+    return best
+
+
+def find_moved_and_removed(plan, destination, should_cancel=None):
+    """Find destination files that no longer belong to a source file.
+
+    Each one that looks like a song now missing under a new path (same type,
+    nearly the same size, and the same title or track number) is paired
+    with it as a move; the rest are listed as removed from the library.
+    """
+    orphans = []
+
+    for root_dir, dir_names, file_names in os.walk(destination):
+        if should_cancel is not None and should_cancel():
+            raise Cancelled()
+
+        root_path = Path(root_dir)
+
+        if root_path == destination:
+            dir_names[:] = [n for n in dir_names if n != BACKUPS_FOLDER]
+
+        dir_names[:] = [n for n in dir_names if not is_junk(n)]
+
+        for name in file_names:
+            if is_junk(name):
+                continue
+
+            path = root_path / name
+            relative = path.relative_to(destination)
+
+            if name_key(relative) in plan.matched:
+                continue
+
+            try:
+                info = os.lstat(path)
+            except OSError:
+                continue
+
+            if stat.S_ISREG(info.st_mode):
+                orphans.append((relative, info.st_size))
+
+    # First pair old copies with songs not copied yet: those moved.
+    missing = [item for item in plan.items if not item.is_symlink]
+    unused = []
+
+    for relative, size in orphans:
+        match = best_match(missing, relative, size)
+
+        if match is None:
+            unused.append((relative, size))
+            continue
+
+        item = missing.pop(match[1])
+        item.replaces = relative
+        plan.moved.append(item)
+
+    # Then with songs already there: an earlier backup copied the edited
+    # version and left the old copy behind as a duplicate.
+    left = []
+
+    if len(unused) <= MAX_DUPLICATE_CHECKS:
+        by_type = {}
+
+        for item in plan.present:
+            by_type.setdefault(item.relative.suffix.lower(), []).append(item)
+
+        for relative, size in unused:
+            candidates = by_type.get(relative.suffix.lower(), [])
+            # Many songs share a track number, so a leftover must also share
+            # its title before it's treated as a duplicate.
+            match = best_match(candidates, relative, size, require_title=True)
+
+            if match is None:
+                left.append(relative)
+            else:
+                plan.duplicates.append((relative, candidates[match[1]]))
+    else:
+        left = [relative for relative, _size in unused]
+
+    plan.removed = sorted(left, key=lambda path: str(path).lower())
+
+
+def remove_empty_folder(folder):
+    """Remove folder if it holds nothing but Mac clutter like .DS_Store."""
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return False
+
+    for name in names:
+        if not is_junk(name) or os.path.isdir(os.path.join(folder, name)):
+            return False
+
+    for name in names:
+        try:
+            os.unlink(os.path.join(folder, name))
+        except OSError:
+            return False
+
+    try:
+        os.rmdir(folder)
+    except OSError:
+        return False
+
+    return True
+
+
+def set_aside(destination_root, relative, folder):
+    """Move destination_root/relative into folder, keeping its path.
+
+    Folders left empty are removed. Nothing is deleted.
+    """
+    old = destination_root / relative
+    new = folder / relative
+    ensure_parent(folder, relative)
+
+    if os.path.lexists(new):
+        raise FileExistsError(errno.EEXIST, "Already set aside", str(new))
+
+    os.rename(old, new)
+    drop_appledouble(new)
+
+    parent = old.parent
+
+    while parent != destination_root and destination_root in parent.parents:
+        if not remove_empty_folder(parent):
+            break
+
+        drop_appledouble(parent)
+        parent = parent.parent
 
 
 def partial_path(destination):

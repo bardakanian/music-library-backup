@@ -2,6 +2,16 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 2.3.0 — 2026-11-13
+
+- New **Sync edits** option (on by default). Editing a song in Apple Music rewrites the file and often moves it to a new Artist/Album folder, which left the old copy on the drive and either skipped the edit or copied the song twice. Now:
+  - an edited song is copied again and its old version is set aside;
+  - a song that moved is copied to its new place and the copy at its old place is set aside;
+  - a leftover old copy of a song already on the drive (from earlier backups) is set aside.
+  Old versions go to `Library Backups/<date>/Replaced/`, keeping their paths, and are never deleted. Folders left empty are removed. Songs no longer in the library are only listed.
+- Old and new copies are matched by file type, nearly the same size, and the same or a shortened title (or the same track number for songs not yet copied); size alone never counts.
+- New **Edits & removals** filter in Activity; Preview lists every change before anything happens.
+- Sync edits applies to backups only; **Import to this computer** still only adds files, so a computer's own music is never moved.
 ## 2.2.2 — 2026-11-12
 
 - Removed: the **Eject** button on the Windows side. Windows has no "Eject" action for USB hard drives that it lists as ordinary disks, and the safe-removal call it does offer was refused by Windows for reasons the app couldn't identify. Use the Windows "Safely Remove Hardware" icon in the taskbar after an import. Eject on the Mac is unchanged.

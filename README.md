@@ -23,6 +23,9 @@ app imports the stick into your music folder and adds the playlists to MusicBee.
   are copied as real files; and paths too long for older Windows apps are flagged.
 - Leaves out Mac-only clutter (`.DS_Store`, `._*` files) so the stick stays clean
   on Windows.
+- **Sync edits**: when you edit a song in Apple Music, the new version replaces the
+  old one on the drive, also when Apple Music moved it to a new Artist/Album folder.
+  Old versions are set aside in `Library Backups/<date>/Replaced/`, never deleted.
 - **Back up library database**: saves a copy of `Music Library.musiclibrary`
   (ratings, play counts, playlists) in a new dated folder under
   `Library Backups/` each run. Earlier copies are kept.
