@@ -138,6 +138,10 @@ class CopyCoreTests(FolderTestCase):
 
         self.assertFalse(inside.exists())
 
+    def test_destination_that_contains_the_source_is_rejected(self):
+        with self.assertRaises(copy_core.FolderError):
+            copy_core.check_folders(str(self.source / "album"), str(self.source))
+
     def test_destination_with_missing_parent_is_rejected(self):
         with self.assertRaises(copy_core.FolderError):
             copy_core.check_folders(

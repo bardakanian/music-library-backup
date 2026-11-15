@@ -2,6 +2,22 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 2.3.3 — 2026-11-14
+
+- Fix: **Import to this computer** no longer copies the old song versions in `Library Backups/<date>/Replaced`. MusicBee's folder scan picked them up as duplicates of the current songs. They stay on the stick.
+- Fix: songs whose names are only a number (such as `1999.mp3`, or `03.mp3` with no title) no longer all count as the same title. **Sync edits** could pair two different songs and set the wrong one aside.
+- Fix: on Windows, imported files were left hidden. The temporary `.part` file is hidden while it's written, and the mark stayed after the rename. It's now cleared.
+- Fix: "Cancelling…" stays in the status while a cancel finishes, instead of being replaced by the next progress update.
+
+## 2.3.2 — 2026-11-14
+
+- Fix: a destination that contains the music folder (such as `~/Music` itself) is now refused. With **Sync edits** on, the app took the library's own files for old copies left on the drive and moved them into `Library Backups/<date>/Replaced`.
+- Fix: a moved song is still copied to its new place when its old copy can't be set aside. Before, the song was left out of the backup. An edited song whose old copy can't be moved still waits, so nothing is overwritten.
+- Fix: the "old versions set aside" count in the summary now counts only those actually moved, not every planned one.
+- Fix: the **Add playlists to MusicBee** box was added to the options row twice.
+- Fix: in Import mode, the stick is now looked for again when the window comes back to the front with no source chosen.
+- Fix: saving settings in the older Tkinter app (`main.py`) no longer erases the mode, import folders and options saved by the main app.
+
 ## 2.3.1 — 2026-11-13
 
 - Fix: in an import, choosing the folder above the backup (for example `MUSIC BACKUP` instead of `MUSIC BACKUP\Music`) said "No Library Backups folder here" even though one sat inside. The music would also have been copied into an extra `Music` folder and the playlists missed. The app now switches to the folder that holds `Library Backups` (up to two levels down, also for automatic detection) and says so in the log.

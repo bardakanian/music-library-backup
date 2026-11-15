@@ -104,6 +104,8 @@ class ImportWindowTests(unittest.TestCase):
             write(stick / "Artist" / "Album" / "01 Song.m4a", "song")
             write(stick / "Artist" / "Album" / "._01 Song.m4a", "junk")
             write(stick / "Library Backups" / "d1" / "Playlists" / "Mix.m3u8", "#EXTM3U")
+            # Old versions a sync set aside stay on the stick.
+            write(stick / "Library Backups" / "d1" / "Replaced" / "Artist" / "Album" / "01 Song.m4a", "old")
             target = root / "pc" / "Library"
             target.parent.mkdir()
 
@@ -118,6 +120,7 @@ class ImportWindowTests(unittest.TestCase):
             self.assertTrue(
                 (target / "Library Backups" / "d1" / "Playlists" / "Mix.m3u8").is_file()
             )
+            self.assertFalse((target / "Library Backups" / "d1" / "Replaced").exists())
 
             again = app_qt.CopyWorker(stick, target, check_folders=False)
             results.clear()
@@ -287,6 +290,18 @@ class PartialNameTests(unittest.TestCase):
     def test_junk_still_covers_partial_files(self):
         name = copy_core.partial_path(Path("Song.m4a")).name
         self.assertTrue(copy_core.is_junk(name))
+
+    def test_copied_file_is_unhidden_after_the_rename(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write(root / "src" / "Song.m4a", "song")
+            (root / "dst").mkdir()
+            item = copy_core.PlanItem(root / "src" / "Song.m4a", Path("Song.m4a"), False, 4)
+
+            with unittest.mock.patch.object(copy_core, "unhide_file") as unhide:
+                self.assertTrue(copy_core.copy_item(item, root / "dst"))
+
+            unhide.assert_called_once_with(root / "dst" / "Song.m4a")
 
 
 

@@ -48,6 +48,7 @@ WINDOWS_MAX_PATH = 259
 
 BACKUPS_FOLDER = "Library Backups"
 PLAYLISTS_FOLDER = "Playlists"
+REPLACED_FOLDER = "Replaced"
 
 DEFAULT_MUSIC_FOLDER = Path.home() / "Music" / "Music"
 
@@ -294,6 +295,15 @@ def check_folders(source_text, destination_text):
             "The destination cannot be inside the source folder.",
         )
 
+    # Sync edits would take the music folder itself for old copies left in
+    # the destination and move them into Library Backups.
+    if destination_resolved in source_resolved.parents:
+        raise FolderError(
+            "Invalid Destination",
+            "The destination cannot contain the source folder. Choose a "
+            "folder outside it, such as one on your USB stick.",
+        )
+
     return source, destination
 
 
@@ -456,6 +466,11 @@ def build_plan(
         root_path = Path(root_dir)
         real_directories = []
 
+        # Old song versions a sync set aside stay on the stick; an import
+        # would hand them to MusicBee as duplicates.
+        if root_path.parent == source / BACKUPS_FOLDER:
+            dir_names[:] = [name for name in dir_names if name != REPLACED_FOLDER]
+
         for directory_name in dir_names:
             if is_junk(directory_name):
                 plan.ignored += 1
@@ -510,7 +525,9 @@ def title_key(name):
     number = track_number(stem)
 
     if number is not None:
-        stem = stem.lstrip("0123456789").lstrip(" -._")
+        # A name that is only a number ("1999", "03") is its own title, or
+        # every such song would look like every other.
+        stem = stem.lstrip("0123456789").lstrip(" -._") or stem
 
     return name_key(Path(windows_part(stem)))
 
@@ -730,6 +747,23 @@ def hide_file(path):
         pass
 
 
+def unhide_file(path):
+    """Clear the hidden mark hide_file set; renaming the file keeps it."""
+    if os.name != "nt":
+        return
+
+    try:
+        import ctypes
+
+        FILE_ATTRIBUTE_HIDDEN = 0x2
+        attributes = os.stat(path).st_file_attributes
+        ctypes.windll.kernel32.SetFileAttributesW(
+            str(path), attributes & ~FILE_ATTRIBUTE_HIDDEN
+        )
+    except (OSError, AttributeError):
+        pass
+
+
 def ensure_parent(destination_root, relative):
     """Create the folders for relative under destination_root.
 
@@ -827,6 +861,7 @@ def copy_item(item, destination_root, on_bytes=None, should_cancel=None):
         drop_appledouble(temporary)
         raise
 
+    unhide_file(destination)
     drop_appledouble(destination)
     return True
 

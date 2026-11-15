@@ -58,7 +58,7 @@ from copy_core import format_size
 APP_NAME = "Music Library Backup"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "2.3.1"
+VERSION = "2.3.3"
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -355,6 +355,7 @@ class CopyWorker(QObject):
             "moved": 0,
             "removed": 0,
             "duplicates": 0,
+            "set_aside": 0,
         }
 
     def cancel(self):
@@ -578,15 +579,16 @@ class CopyWorker(QObject):
     def set_aside_old_versions(self, plan):
         """Move old versions of edited and moved songs into Replaced.
 
-        Returns the items still to copy; an item whose old version couldn't
-        be moved is left out so nothing is overwritten.
+        Returns the items still to copy. An edited song whose old version
+        couldn't be moved is left out, since it would land on that same
+        path; a moved song is still copied to its new place.
         """
         if not plan.duplicates and not any(
             item.replaces is not None for item in plan.items
         ):
             return plan.items
 
-        folder = self.get_snapshot() / "Replaced"
+        folder = self.get_snapshot() / copy_core.REPLACED_FOLDER
 
         try:
             folder.mkdir()
@@ -604,6 +606,8 @@ class CopyWorker(QObject):
                     "Could not set aside " + str(relative) + " — "
                     + (getattr(error, "strerror", None) or str(error)),
                 )
+            else:
+                self.stats["set_aside"] += 1
 
         remaining = []
 
@@ -616,15 +620,23 @@ class CopyWorker(QObject):
                 copy_core.set_aside(self.destination, item.replaces, folder)
             except (copy_core.DestinationGone, OSError) as error:
                 self.stats["failed"] += 1
-                self.stats["to_copy"] -= 1
-                self.stats["total_bytes"] -= item.size
                 self.add_log(
                     "error",
                     "Could not set aside " + str(item.replaces) + " — "
                     + (getattr(error, "strerror", None) or str(error)),
                 )
+
+                if copy_core.name_key(item.target) != copy_core.name_key(
+                    item.replaces
+                ):
+                    # The new place is free, and copy_item never overwrites.
+                    remaining.append(item)
+                else:
+                    self.stats["to_copy"] -= 1
+                    self.stats["total_bytes"] -= item.size
                 continue
 
+            self.stats["set_aside"] += 1
             remaining.append(item)
 
         return remaining
@@ -1308,7 +1320,6 @@ class MainWindow(QMainWindow):
             "After the import, copies the playlists into MusicBee's Playlists\n"
             "folder with full paths. Playlists MusicBee already has are kept."
         )
-        row.addWidget(self.musicbee_box)
 
         for box in (
             self.windows_box,
@@ -1627,7 +1638,10 @@ class MainWindow(QMainWindow):
             if (
                 self.mode == MODE_IMPORT
                 and self.thread is None
-                and not Path(self.source_field.text() or ".").is_dir()
+                and not (
+                    self.source_field.text()
+                    and Path(self.source_field.text()).is_dir()
+                )
             ):
                 found = self.detected_stick()
 
@@ -1993,7 +2007,12 @@ class MainWindow(QMainWindow):
     @Slot(dict)
     def update_progress(self, stats):
         self.set_tiles(stats)
+        self.show_progress(stats)
 
+        if self.worker is not None and self.worker.cancel_requested:
+            self.status_title.setText("Cancelling…")
+
+    def show_progress(self, stats):
         if stats["phase"] == "scanning":
             self.status_title.setText("Checking what's missing…")
             self.percent_label.setText("")
@@ -2105,12 +2124,9 @@ class MainWindow(QMainWindow):
             )
             detail = format_size(stats["copied_bytes"]) + " copied" + problem_text
 
-            if stats["updated"] or stats["moved"] or stats["duplicates"]:
+            if stats["set_aside"]:
                 detail += (
-                    " · " + plural(
-                        stats["updated"] + stats["moved"] + stats["duplicates"],
-                        "old version",
-                    )
+                    " · " + plural(stats["set_aside"], "old version")
                     + " set aside"
                 )
 

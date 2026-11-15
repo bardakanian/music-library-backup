@@ -186,12 +186,18 @@ class CopyMissingFilesApp:
                 exist_ok=True,
             )
 
-            settings = {
-                "source": self.source_var.get().strip(),
-                "destination": (
-                    self.destination_var.get().strip()
-                ),
-            }
+            # app_qt.py shares this file, so keep the settings it added.
+            try:
+                with CONFIG_FILE.open("r", encoding="utf-8") as file:
+                    settings = json.load(file)
+            except (OSError, ValueError):
+                settings = {}
+
+            if not isinstance(settings, dict):
+                settings = {}
+
+            settings["source"] = self.source_var.get().strip()
+            settings["destination"] = self.destination_var.get().strip()
 
             with CONFIG_FILE.open(
                 "w",

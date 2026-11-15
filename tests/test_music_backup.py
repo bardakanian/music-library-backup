@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import shutil
@@ -363,9 +364,53 @@ class SettingsMigrationTests(unittest.TestCase):
                 finally:
                     window.deleteLater()
 
+    def test_musicbee_option_is_in_the_layout_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with mock.patch.object(app_qt, "CONFIG_FILE", Path(temp) / "settings.json"), \
+                    mock.patch.object(app_qt, "OLD_CONFIG_FILE", Path(temp) / "old.json"):
+                window = app_qt.MainWindow()
 
-if __name__ == "__main__":
-    unittest.main()
+                try:
+                    def count(layout):
+                        found = 0
+
+                        for index in range(layout.count()):
+                            entry = layout.itemAt(index)
+                            found += entry.widget() is window.musicbee_box
+
+                            if entry.layout() is not None:
+                                found += count(entry.layout())
+
+                        return found
+
+                    self.assertEqual(count(window.centralWidget().layout()), 1)
+                finally:
+                    window.deleteLater()
+
+    def test_tkinter_app_keeps_the_other_settings(self):
+        import main
+
+        class Var:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "settings.json"
+            write(config, json.dumps({"mode": "import", "sync_edits": False, "source": "old"}))
+            app = mock.Mock(source_var=Var("/new/source"), destination_var=Var("/new/dest"))
+
+            with mock.patch.object(main, "CONFIG_DIR", Path(temp)), \
+                    mock.patch.object(main, "CONFIG_FILE", config):
+                main.CopyMissingFilesApp.save_settings(app)
+
+            settings = json.loads(config.read_text(encoding="utf-8"))
+            self.assertEqual(settings["mode"], "import")
+            self.assertIs(settings["sync_edits"], False)
+            self.assertEqual(settings["source"], "/new/source")
+            self.assertEqual(settings["destination"], "/new/dest")
 
 
 class FolderMismatchTests(unittest.TestCase):
@@ -556,3 +601,41 @@ class SyncEditsTests(unittest.TestCase):
         self.assertEqual(copy_core.track_number("1-03 Song.m4a"), 1)
         self.assertIsNone(copy_core.track_number("Song.m4a"))
         self.assertEqual(copy_core.title_key("03 Song?.m4a"), copy_core.title_key("Song_.mp3"))
+
+    def test_songs_named_only_by_number_are_not_the_same_song(self):
+        self.assertNotEqual(copy_core.title_key("1999.mp3"), copy_core.title_key("1984.mp3"))
+        self.assertEqual(copy_core.title_key("1999.mp3"), copy_core.title_key("1999.m4a"))
+
+        write_bytes(self.source / "Other" / "Album" / "1984.mp3", 5_100_000)
+        write_bytes(self.destination / "Old" / "Album" / "1987.mp3", 5_050_000)
+
+        stats = self.run_worker(preview=True)
+
+        self.assertEqual(stats["moved"], 1)  # only the fixture's own move
+        self.assertEqual(stats["removed"], 2)
+
+    def test_moved_song_is_copied_even_if_its_old_copy_cant_be_set_aside(self):
+        def failing(root, relative, folder):
+            raise PermissionError(errno.EACCES, "Permission denied", str(root / relative))
+
+        with mock.patch.object(copy_core, "set_aside", failing):
+            stats = self.run_worker()
+
+        # The moved song lands at its new place; the edited one would have
+        # replaced its old copy, so it waits for the next run.
+        self.assertTrue((self.destination / "Coldplay" / "Parachutes" / "01 Dont Panic.mp3").is_file())
+        self.assertEqual((self.destination / "Band" / "Album" / "02 Edited.mp3").read_bytes()[:1], b"o")
+        self.assertTrue((self.destination / "Unknown Artist" / "Unknown Album" / "01 Track 1.mp3").is_file())
+        self.assertEqual(stats["failed"], 2)
+        self.assertEqual(stats["set_aside"], 0)
+        self.assertEqual(stats["copied"], 2)
+        self.assertEqual(stats["to_copy"], 2)
+
+    def test_set_aside_count_is_what_was_moved(self):
+        stats = self.run_worker()
+
+        self.assertEqual(stats["set_aside"], 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
