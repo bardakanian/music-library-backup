@@ -1,6 +1,7 @@
 import os
 import plistlib
 import re
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,6 +63,7 @@ class VersionTests(unittest.TestCase):
 
         self.assertRegex(changelog, heading)
 
+    @unittest.skipUnless(sys.platform == "darwin", "the .app bundle is built on a Mac")
     def test_bundle_carries_version(self):
         with tempfile.TemporaryDirectory() as temp:
             bundle = make_launcher.build_bundle(temp)

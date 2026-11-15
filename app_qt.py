@@ -58,20 +58,12 @@ from copy_core import format_size
 APP_NAME = "Music Library Backup"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "2.3.3"
+VERSION = "2.3.4"
 
 IS_WINDOWS = sys.platform == "win32"
 
 
-def settings_base():
-    if IS_WINDOWS:
-        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support"
-
-    return Path.home() / ".config"
-
+settings_base = copy_core.settings_base
 
 CONFIG_DIR = settings_base() / APP_NAME
 
@@ -288,6 +280,14 @@ def format_duration(seconds):
         return f"about {minutes} min"
 
     return f"about {minutes // 60} h {minutes % 60} min"
+
+
+def native_path(path):
+    """Qt hands out paths with forward slashes, also on Windows ("E:/Music").
+
+    Show and save them the way Windows writes them ("E:\\Music").
+    """
+    return os.path.normpath(path) if IS_WINDOWS and path else path
 
 
 def plural(count, word):
@@ -959,11 +959,22 @@ class CopyWorker(QObject):
             self.stop_once("The destination drive is full.")
             return
 
-        if copy_core.is_missing_error(error):
-            if not self.destination.is_dir():
-                self.stop_once(gone)
-                return
+        # An unplugged drive shows up as all kinds of errors (on Windows
+        # often not "not found"), so check both folders before blaming
+        # the file. Otherwise a stick pulled out mid-import would list
+        # every remaining song as skipped instead of stopping.
+        if not self.destination.is_dir():
+            self.stop_once(gone)
+            return
 
+        if not self.source.is_dir():
+            self.stop_once(
+                "The music folder you're copying from is no longer "
+                "available. Is the drive or USB stick still connected?"
+            )
+            return
+
+        if copy_core.is_missing_error(error):
             stats["skipped"] += 1
             self.add_log(
                 "skipped",
@@ -1111,7 +1122,7 @@ class FolderCard(QFrame):
         )
 
         if folder:
-            self.set_text(folder)
+            self.set_text(native_path(folder))
             self.changed.emit()
 
     def dropped_folder(self, event):
@@ -1121,7 +1132,7 @@ class FolderCard(QFrame):
             path = urls[0].toLocalFile()
 
             if Path(path).is_dir():
-                return path
+                return native_path(path)
 
         return None
 
@@ -1211,7 +1222,14 @@ class MainWindow(QMainWindow):
         self.log_text.setLineWrapMode(QPlainTextEdit.NoWrap)
 
         log_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
-        log_font.setPointSize(11)
+
+        if IS_WINDOWS:
+            # Windows draws points a third bigger than macOS, and its fixed
+            # system font is Courier New; Consolas reads far better.
+            log_font.setFamilies(["Consolas", log_font.family()])
+            log_font.setPointSize(9)
+        else:
+            log_font.setPointSize(11)
         self.log_text.setFont(log_font)
 
         main.addWidget(self.log_text, 1)
@@ -1480,7 +1498,7 @@ class MainWindow(QMainWindow):
         volume = copy_core.unmounted_volume(path)
 
         if volume is not None:
-            return "Drive \"" + volume.name + "\" is not connected", True
+            return "Drive \"" + copy_core.volume_label(volume) + "\" is not connected", True
 
         if not Path(path).is_dir():
             if self.mode == MODE_IMPORT:
@@ -1616,7 +1634,7 @@ class MainWindow(QMainWindow):
         volume = copy_core.unmounted_volume(path)
 
         if volume is not None:
-            return "Drive \"" + volume.name + "\" is not connected", True
+            return "Drive \"" + copy_core.volume_label(volume) + "\" is not connected", True
 
         destination = Path(path)
         free = copy_core.free_space(destination)
@@ -1777,7 +1795,8 @@ class MainWindow(QMainWindow):
                 value = settings.get(key)
 
                 if isinstance(value, str):
-                    self.folders[mode][index] = value
+                    # Earlier versions saved "E:/Music" on Windows.
+                    self.folders[mode][index] = native_path(value)
 
         if not IS_WINDOWS and settings.get("mode") in (MODE_BACKUP, MODE_IMPORT):
             self.mode = settings["mode"]
@@ -2241,7 +2260,12 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self.ask_about_mismatch(mismatch))
 
     def ask_about_mismatch(self, mismatch):
-        role = "music folder" if mismatch["role"] == "source" else "destination"
+        importing = self.mode == MODE_IMPORT
+
+        if mismatch["role"] == "source":
+            role = "folder on the stick" if importing else "music folder"
+        else:
+            role = "folder on this computer" if importing else "destination"
 
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
@@ -2252,7 +2276,10 @@ class MainWindow(QMainWindow):
             + "\n\nUse that folder as the " + role + " instead?"
         )
         use_button = box.addButton("Use That Folder", QMessageBox.AcceptRole)
-        anyway_button = box.addButton("Back Up Anyway", QMessageBox.DestructiveRole)
+        anyway_button = box.addButton(
+            "Import Anyway" if importing else "Back Up Anyway",
+            QMessageBox.DestructiveRole,
+        )
         box.addButton(QMessageBox.Cancel)
         box.setDefaultButton(use_button)
         box.exec()

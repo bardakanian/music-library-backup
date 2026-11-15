@@ -2,6 +2,26 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 2.3.4 — 2026-11-14
+
+Windows fixes:
+
+- Fix: a song whose earlier copy was interrupted (crash, power cut, app killed) failed once with "Permission denied". The leftover partial file is hidden, and Windows won't open a hidden file for writing. Leftover partials are now removed before copying.
+- Fix: paths over 260 characters failed to copy (as "no longer available") on PCs where Windows long paths are off, which is the default. An import can cross the limit even when every path fit on the stick, since `C:\Users\<name>\Music\Apple Music Library` is much longer than `E:\Music`. Such paths are now copied, and flagged under **Problems** because MusicBee and many other players can't open them.
+- Fix: pulling out the stick during an import listed every remaining song as skipped. The import now stops and says the stick is gone.
+- Fix: a copy failed when a virus scanner or the search indexer still had the new file open for a moment. The final rename is now retried for a few seconds.
+- Fix: songs marked read-only on the stick stayed read-only on the PC, so MusicBee couldn't save tag edits to them.
+- Fix: the default import folder and MusicBee's Playlists folder are now found in your real Music folder when Windows keeps it elsewhere (OneDrive folder backup, or moved in its Properties). Before, the music went to an unused `C:\Users\<name>\Music` and the playlists weren't added to MusicBee.
+- Fix: looking for the stick no longer checks network drives, which can freeze the window for seconds whenever it comes to the front while a server is away. It only checks drive letters that are in use, and an empty card reader can't pop up "There is no disk in the drive".
+- Fix: a source on an unplugged drive now says "Drive "E:" is not connected" instead of "Folder not found".
+- Fix: folders chosen or dropped are shown and saved as `E:\Music` instead of `E:/Music`. Earlier saved settings are converted when they're loaded.
+- Fix: links in the source are copied as the files they point to on Windows, where only an administrator can make links.
+- Fix: in an import, the "copy your music a second time" warning offers **Import Anyway** instead of **Back Up Anyway**.
+- Fix: **Windows-safe names** also covers `COM0`, `LPT0`, `COM¹`–`COM³`, `LPT¹`–`LPT³`, `CONIN$` and `CONOUT$`, which Windows reserves as well.
+- Fix: the older Tkinter app (`main.py`) kept its settings in `C:\Users\<name>\Library\Application Support` on Windows. It now shares `%APPDATA%\Music Library Backup` with the main app, and uses Windows fonts.
+- The Activity log uses Consolas at a size that matches the rest of the window on Windows.
+- The tests now run on Windows. Tests that need Mac-only file names, links or the `.app` bundle are skipped there, and new tests cover the fixes above.
+
 ## 2.3.3 — 2026-11-14
 
 - Fix: **Import to this computer** no longer copies the old song versions in `Library Backups/<date>/Replaced`. MusicBee's folder scan picked them up as duplicates of the current songs. They stay on the stick.

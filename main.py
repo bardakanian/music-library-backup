@@ -11,12 +11,9 @@ import copy_core
 
 APP_NAME = "Music Library Backup"
 
-CONFIG_DIR = (
-    Path.home()
-    / "Library"
-    / "Application Support"
-    / APP_NAME
-)
+# The same folder as app_qt.py (%APPDATA% on Windows), so both apps share
+# one settings file.
+CONFIG_DIR = copy_core.settings_base() / APP_NAME
 
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 
@@ -48,7 +45,7 @@ class CopyMissingFilesApp:
         ttk.Label(
             main,
             text="Music Library Backup",
-            font=("Helvetica", 20, "bold"),
+            font=("Segoe UI" if copy_core.IS_WINDOWS else "Helvetica", 20, "bold"),
         ).pack(anchor="w", pady=(0, 15))
 
         source_frame = ttk.LabelFrame(
@@ -129,7 +126,7 @@ class CopyMissingFilesApp:
             log_frame,
             wrap="word",
             state="disabled",
-            font=("Menlo", 11),
+            font=("Consolas", 9) if copy_core.IS_WINDOWS else ("Menlo", 11),
         )
 
         scrollbar = ttk.Scrollbar(
@@ -229,7 +226,7 @@ class CopyMissingFilesApp:
         )
 
         if folder:
-            self.source_var.set(folder)
+            self.source_var.set(os.path.normpath(folder))
             self.save_settings()
 
     def select_destination(self):
@@ -246,7 +243,7 @@ class CopyMissingFilesApp:
         )
 
         if folder:
-            self.destination_var.set(folder)
+            self.destination_var.set(os.path.normpath(folder))
             self.save_settings()
 
     def log(self, message):

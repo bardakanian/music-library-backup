@@ -150,6 +150,34 @@ class ImportWindowTests(unittest.TestCase):
         self.assertEqual(Path(window.source_field.text()), stick / "Music")
         self.assertIn("Music Library Backup found", window.source_field.info_label.text())
 
+    @unittest.skipUnless(app_qt.IS_WINDOWS, "Windows only")
+    def test_folders_use_windows_separators(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        config = Path(temp.name) / "new.json"
+        # Saved by earlier versions straight from the folder chooser.
+        config.write_text(
+            '{"import_source": "Q:/Music", "import_destination": "P:/Library"}',
+            encoding="utf-8",
+        )
+
+        for name, file in (("CONFIG_FILE", config), ("OLD_CONFIG_FILE", Path(temp.name) / "old.json")):
+            patcher = unittest.mock.patch.object(app_qt, name, file)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        patcher = unittest.mock.patch.object(copy_core, "find_backup_drives", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        window = app_qt.MainWindow()
+        self.addCleanup(window.close)
+
+        self.assertEqual(window.source_field.text(), "Q:\\Music")
+        self.assertEqual(window.destination_field.text(), "P:\\Library")
+        self.assertEqual(app_qt.native_path("E:/"), "E:\\")
+        self.assertIn('Drive "Q:" is not connected', window.source_field.info_label.text())
+
     def test_mode_switch_keeps_each_modes_folders(self):
         # Never touch the real settings file: closing a window saves it.
         temp = tempfile.TemporaryDirectory()

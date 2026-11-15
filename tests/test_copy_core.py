@@ -26,6 +26,19 @@ def partial_files(folder):
     ]
 
 
+def try_symlink(target, link):
+    """Make a link, or return False where that isn't allowed.
+
+    Windows only lets administrators (or Developer Mode) make links.
+    """
+    try:
+        os.symlink(target, link)
+    except OSError:
+        return False
+
+    return True
+
+
 class FolderTestCase(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -38,7 +51,7 @@ class FolderTestCase(unittest.TestCase):
         write(self.source / "album" / "a.mp3", "new a")
         write(self.source / "album" / "sub" / "b.mp3", "b")
         write(self.source / "album" / "c.mp3", "longer c")
-        os.symlink("album/a.mp3", self.source / "link.mp3")
+        self.links = int(try_symlink("album/a.mp3", self.source / "link.mp3"))
 
         write(self.destination / "album" / "a.mp3", "old a")
         write(self.destination / "album" / "c.mp3", "c")
@@ -52,8 +65,8 @@ class CopyCoreTests(FolderTestCase):
         plan = self.plan()
 
         self.assertEqual(
-            sorted(str(item.relative) for item in plan.items),
-            ["album/sub/b.mp3", "link.mp3"],
+            sorted(item.relative.as_posix() for item in plan.items),
+            ["album/sub/b.mp3"] + ["link.mp3"] * self.links,
         )
         self.assertEqual(plan.existing, 1)
         self.assertEqual(
@@ -66,7 +79,13 @@ class CopyCoreTests(FolderTestCase):
             self.assertTrue(copy_core.copy_item(item, self.destination))
 
         self.assertEqual((self.destination / "album" / "sub" / "b.mp3").read_text(), "b")
-        self.assertEqual(os.readlink(self.destination / "link.mp3"), "album/a.mp3")
+
+        if self.links and copy_core.IS_WINDOWS:
+            # Copied as the file it points to.
+            self.assertEqual((self.destination / "link.mp3").read_text(), "new a")
+        elif self.links:
+            self.assertEqual(os.readlink(self.destination / "link.mp3"), "album/a.mp3")
+
         self.assertEqual((self.destination / "album" / "a.mp3").read_text(), "old a")
         self.assertEqual((self.destination / "album" / "c.mp3").read_text(), "c")
         self.assertEqual(partial_files(self.destination), [])
@@ -109,7 +128,10 @@ class CopyCoreTests(FolderTestCase):
 
         self.assertFalse(gone.exists())
 
-    @unittest.skipIf(os.geteuid() == 0, "root can read any folder")
+    @unittest.skipIf(
+        os.name == "nt" or os.geteuid() == 0,
+        "root can read any folder; Windows ignores chmod(0) on folders",
+    )
     def test_unreadable_folder_is_reported(self):
         locked = self.source / "locked"
         write(locked / "d.mp3", "d")
@@ -122,13 +144,22 @@ class CopyCoreTests(FolderTestCase):
         self.assertIn("locked", str(plan.errors[0][0]))
 
     def test_unplugged_drive_is_rejected(self):
-        with self.assertRaises(copy_core.FolderError) as caught:
-            copy_core.check_folders(
-                str(self.source),
-                "/Volumes/No Such Drive 7f3a/Music",
+        if copy_core.IS_WINDOWS:
+            letter = next(
+                letter for letter in "ZYXWVUTSRQPONMLKJI"
+                if not os.path.exists(letter + ":\\")
             )
+            unplugged = letter + ":\\Music"
+        else:
+            unplugged = "/Volumes/No Such Drive 7f3a/Music"
+
+        with self.assertRaises(copy_core.FolderError) as caught:
+            copy_core.check_folders(str(self.source), unplugged)
 
         self.assertEqual(caught.exception.title, "Drive Not Connected")
+
+        if copy_core.IS_WINDOWS:
+            self.assertIn('"' + letter + ':"', caught.exception.message)
 
     def test_destination_inside_source_is_rejected_without_creating_it(self):
         inside = self.source / "backup"
@@ -168,14 +199,14 @@ class WorkerTests(FolderTestCase):
         stats = self.run_worker(preview=True)
 
         self.assertEqual(stats["phase"], "done")
-        self.assertEqual(stats["to_copy"], 2)
+        self.assertEqual(stats["to_copy"], 1 + self.links)
         self.assertFalse((self.destination / "album" / "sub").exists())
 
     def test_copy_reports_counts(self):
         stats = self.run_worker(preview=False)
 
         self.assertEqual(stats["phase"], "done")
-        self.assertEqual(stats["copied"], 2)
+        self.assertEqual(stats["copied"], 1 + self.links)
         self.assertEqual(stats["existing"], 1)
         self.assertEqual(stats["skipped"], 1)
         self.assertEqual(stats["failed"], 0)
@@ -200,7 +231,7 @@ class WorkerTests(FolderTestCase):
             stats = self.run_worker(preview=False)
 
         self.assertEqual(stats["phase"], "done")
-        self.assertEqual(stats["copied"], 10)
+        self.assertEqual(stats["copied"], 9 + self.links)
         self.assertEqual(stats["done_bytes"], stats["total_bytes"])
         self.assertEqual(partial_files(self.destination), [])
 
@@ -218,8 +249,8 @@ class WorkerTests(FolderTestCase):
 
         self.assertEqual(stats["phase"], "done")
         self.assertEqual(stats["failed"], 1)
-        self.assertEqual(stats["copied"], 7)
-        self.assertEqual(stats["processed"], 8)
+        self.assertEqual(stats["copied"], 6 + self.links)
+        self.assertEqual(stats["processed"], 7 + self.links)
 
     def test_full_drive_stops_remaining_copies(self):
         self.add_album(50)
@@ -273,6 +304,144 @@ class WorkerTests(FolderTestCase):
         self.assertEqual(stats["phase"], "stopped")
         self.assertEqual(stats["copied"], 0)
         self.assertFalse((self.destination / "album" / "sub").exists())
+
+    def test_unplugged_source_stops_instead_of_skipping_everything(self):
+        self.add_album(30)
+        moved_away = self.source.parent / "unplugged"
+
+        def unplug(*_args, **_kwargs):
+            if self.source.exists():
+                os.rename(self.source, moved_away)
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+        with mock.patch.object(copy_core, "copy_item", unplug):
+            stats = self.run_worker(preview=False)
+
+        self.assertEqual(stats["phase"], "stopped")
+        self.assertIn("no longer available", stats["message"])
+        self.assertLessEqual(stats["skipped"], 1 + copy_core.PARALLEL_COPIES * 2)
+
+
+class WindowsCopyTests(unittest.TestCase):
+    """Things that only go wrong on a Windows drive."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.source = self.root / "stick"
+        self.destination = self.root / "pc"
+        write(self.source / "Artist" / "Song.m4a", "song")
+        self.destination.mkdir()
+        self.item = copy_core.PlanItem(
+            self.source / "Artist" / "Song.m4a", Path("Artist") / "Song.m4a", False, 4
+        )
+
+    def test_partial_file_left_by_a_crash_does_not_block_the_copy(self):
+        # Windows won't open a hidden file for writing; the partial is hidden.
+        partial = copy_core.partial_path(self.destination / self.item.target)
+        write(partial, "half")
+        copy_core.hide_file(partial)
+
+        self.assertTrue(copy_core.copy_item(self.item, self.destination))
+        self.assertEqual((self.destination / "Artist" / "Song.m4a").read_text(), "song")
+        self.assertEqual(partial_files(self.destination), [])
+
+    def test_file_that_appears_during_the_rename_is_kept(self):
+        def appeared(_old, new):
+            write(Path(new), "theirs")
+            raise FileExistsError(errno.EEXIST, "File exists")
+
+        with mock.patch.object(copy_core.os, "rename", appeared):
+            self.assertFalse(copy_core.copy_item(self.item, self.destination))
+
+        self.assertEqual((self.destination / "Artist" / "Song.m4a").read_text(), "theirs")
+        self.assertEqual(partial_files(self.destination), [])
+
+    @unittest.skipUnless(copy_core.IS_WINDOWS, "Windows only")
+    def test_file_still_open_elsewhere_is_renamed_on_a_retry(self):
+        real_rename = os.rename
+        calls = []
+
+        def busy_then_free(old, new):
+            calls.append(1)
+
+            if len(calls) < 3:
+                error = PermissionError(errno.EACCES, "in use")
+                error.winerror = 32
+                raise error
+
+            real_rename(old, new)
+
+        with mock.patch.object(copy_core.os, "rename", busy_then_free), \
+                mock.patch.object(copy_core.time, "sleep"):
+            self.assertTrue(copy_core.copy_item(self.item, self.destination))
+
+        self.assertEqual(len(calls), 3)
+        self.assertTrue((self.destination / "Artist" / "Song.m4a").is_file())
+
+    @unittest.skipUnless(copy_core.IS_WINDOWS, "Windows only")
+    def test_copied_file_is_visible_and_writable(self):
+        source = self.item.source
+        os.chmod(source, 0o444)
+        self.addCleanup(os.chmod, source, 0o666)
+
+        self.assertTrue(copy_core.copy_item(self.item, self.destination))
+
+        copied = self.destination / "Artist" / "Song.m4a"
+        attributes = os.stat(copied).st_file_attributes
+        self.assertFalse(attributes & 0x2, "hidden")
+        self.assertFalse(attributes & 0x1, "read-only")
+
+    @unittest.skipUnless(copy_core.IS_WINDOWS, "Windows only")
+    def test_paths_longer_than_260_characters_are_copied(self):
+        deep = Path(*["Folder %02d with a long name" % n for n in range(12)])
+        write(self.source / deep / "Song.m4a", "deep")
+        item = copy_core.PlanItem(self.source / deep / "Song.m4a", deep / "Song.m4a", False, 4)
+        target = self.destination / item.target
+        self.assertGreater(len(str(target)), 300)
+
+        plan = copy_core.build_plan(self.source, self.destination)
+        self.assertIn(item.relative, [i.relative for i in plan.items])
+        self.assertTrue(plan.warnings)
+
+        self.assertTrue(copy_core.copy_item(item, self.destination))
+        self.assertTrue(os.path.isfile(copy_core.os_path(target)))
+        self.assertEqual(
+            copy_core.build_plan(self.source, self.destination).existing, 1
+        )
+
+    @unittest.skipUnless(copy_core.IS_WINDOWS, "Windows only")
+    def test_long_path_form(self):
+        long = "C:\\" + "a" * 300
+        self.assertEqual(copy_core.os_path(long), "\\\\?\\" + long)
+        self.assertEqual(
+            copy_core.os_path("\\\\server\\share\\" + "a" * 300),
+            "\\\\?\\UNC\\server\\share\\" + "a" * 300,
+        )
+        self.assertEqual(copy_core.os_path(Path("C:\\short")), Path("C:\\short"))
+
+    @unittest.skipUnless(copy_core.IS_WINDOWS, "Windows only")
+    def test_drive_list_leaves_out_the_system_drive(self):
+        roots = copy_core.list_drive_roots()
+        system = os.environ.get("SystemDrive", "C:").upper()
+
+        self.assertTrue(all(isinstance(root, Path) for root in roots))
+        self.assertNotIn(system, [root.drive.upper() for root in roots])
+
+    @unittest.skipUnless(copy_core.IS_WINDOWS, "Windows only")
+    def test_music_folder_is_the_real_one(self):
+        folder = copy_core.user_music_folder()
+
+        self.assertTrue(folder.is_dir())
+        self.assertEqual(copy_core.default_import_folder().parent, folder)
+
+    def test_settings_live_in_the_usual_place(self):
+        base = copy_core.settings_base()
+
+        if copy_core.IS_WINDOWS:
+            self.assertNotIn("Library", base.parts)
+            self.assertEqual(base, Path(os.environ["APPDATA"]))
 
 
 if __name__ == "__main__":

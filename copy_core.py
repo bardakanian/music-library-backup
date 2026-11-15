@@ -10,7 +10,9 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import threading
+import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
@@ -37,10 +39,12 @@ JUNK_NAMES = {".DS_Store", ".localized", "Icon\r"}
 JUNK_PREFIXES = ("._", PARTIAL_PREFIX)
 
 WINDOWS_BAD_CHARACTERS = set('<>:"/\\|?*')
+# Device names Windows won't let a file have, with or without an extension.
+# COM0, LPT0 and the superscript digits are also on Microsoft's list.
 WINDOWS_RESERVED_NAMES = (
-    {"CON", "PRN", "AUX", "NUL"}
-    | {"COM" + str(number) for number in range(1, 10)}
-    | {"LPT" + str(number) for number in range(1, 10)}
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {"COM" + digit for digit in "0123456789¹²³"}
+    | {"LPT" + digit for digit in "0123456789¹²³"}
 )
 
 # Older Windows apps can't open paths longer than this, drive letter included.
@@ -51,6 +55,48 @@ PLAYLISTS_FOLDER = "Playlists"
 REPLACED_FOLDER = "Replaced"
 
 DEFAULT_MUSIC_FOLDER = Path.home() / "Music" / "Music"
+
+IS_WINDOWS = os.name == "nt"
+
+# Windows error codes for a file another program (a virus scanner, the
+# search indexer, a player) still has open.
+WINDOWS_IN_USE_ERRORS = {5, 32, 33}
+
+
+def settings_base():
+    """The folder that holds this user's app settings."""
+    if IS_WINDOWS:
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support"
+
+    return Path.home() / ".config"
+
+
+def os_path(path):
+    """Return path in a form Windows accepts even past 260 characters.
+
+    Windows refuses longer paths unless long paths were turned on for the
+    whole system, which is off by default. An import can cross the limit
+    even when every path fit on the stick, because a folder such as
+    C:\\Users\\<name>\\Music\\Apple Music Library is much longer than E:\\Music.
+    The "\\\\?\\" form lifts the limit. Elsewhere path is returned as it is.
+    """
+    if not IS_WINDOWS:
+        return path
+
+    text = os.path.abspath(path)
+
+    # Folders must stay 12 characters under the limit to leave room for a
+    # short 8.3 name inside them.
+    if len(text) < WINDOWS_MAX_PATH - 12 or text.startswith("\\\\?\\"):
+        return path
+
+    if text.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + text[2:]
+
+    return "\\\\?\\" + text
 
 
 class Cancelled(Exception):
@@ -126,7 +172,7 @@ def drop_appledouble(path):
     path = Path(path)
 
     try:
-        os.unlink(path.with_name("._" + path.name))
+        os.unlink(os_path(path.with_name("._" + path.name)))
     except OSError:
         pass
 
@@ -166,6 +212,10 @@ def windows_relative(relative):
 
 def windows_path_length(destination, target):
     """Length of the path as Windows would see it, e.g. E:\\Music\\..."""
+    if IS_WINDOWS:
+        # Already on Windows: count the real path, drive or share included.
+        return len(os.path.join(os.path.abspath(destination), *target.parts))
+
     parts = Path(os.path.abspath(destination)).parts
 
     if len(parts) >= 3 and parts[1] == "Volumes":
@@ -193,8 +243,30 @@ def format_size(size):
     return f"{size:,} bytes"
 
 
+def volume_label(volume):
+    """How to name a drive in a message: "STICK" on a Mac, "E:" on Windows."""
+    return volume.name or volume.drive or str(volume)
+
+
 def unmounted_volume(path):
-    """Return /Volumes/<name> for a path on a drive that isn't connected."""
+    """Return the drive of a path on a drive that isn't connected.
+
+    That is /Volumes/<name> on a Mac, or the drive letter's root (E:\\) on
+    Windows, where an unplugged stick's letter simply disappears.
+    """
+    if IS_WINDOWS:
+        drive = Path(os.path.abspath(path)).drive
+
+        # Only drive letters: a network share that doesn't answer is
+        # reported as a missing folder instead.
+        if len(drive) == 2 and drive[1] == ":":
+            root = Path(drive + "\\")
+
+            if not os.path.isdir(root):
+                return root
+
+        return None
+
     parts = Path(os.path.abspath(path)).parts
 
     if len(parts) >= 3 and parts[1] == "Volumes":
@@ -254,7 +326,7 @@ def check_folders(source_text, destination_text):
         if volume is not None:
             raise FolderError(
                 "Drive Not Connected",
-                "The " + role + " drive \"" + volume.name
+                "The " + role + " drive \"" + volume_label(volume)
                 + "\" is not connected. Connect it and try again.",
             )
 
@@ -369,14 +441,14 @@ def build_plan(
 
         try:
             found = target
-            destination_info = lstat_or_none(destination / target)
+            destination_info = lstat_or_none(os_path(destination / target))
 
             # Copies made before names were made Windows-safe still count.
             # exFAT may reject the old name outright instead of not finding it.
             if destination_info is None and target != relative:
                 found = relative
                 try:
-                    destination_info = lstat_or_none(destination / relative)
+                    destination_info = lstat_or_none(os_path(destination / relative))
                 except OSError:
                     destination_info = None
         except OSError as error:
@@ -384,11 +456,12 @@ def build_plan(
             return
 
         if (
-            windows_safe
+            (windows_safe or IS_WINDOWS)
             and destination_info is None
             and stat.S_ISLNK(source_info.st_mode)
         ):
-            # exFAT can't store links, so copy what the link points to.
+            # exFAT can't store links, and on Windows only an administrator
+            # (or Developer Mode) may make one, so copy what the link points to.
             try:
                 source_info = os.stat(source_path)
             except OSError:
@@ -444,7 +517,9 @@ def build_plan(
         if target != relative:
             plan.renamed += 1
 
-        if windows_safe:
+        # On Windows itself the copy still works (see os_path), but MusicBee
+        # and many other players can't open a path that long.
+        if windows_safe or IS_WINDOWS:
             length = windows_path_length(destination, target)
 
             if length > WINDOWS_MAX_PATH:
@@ -741,7 +816,7 @@ def hide_file(path):
 
         FILE_ATTRIBUTE_HIDDEN = 0x2
         ctypes.windll.kernel32.SetFileAttributesW(
-            str(path), FILE_ATTRIBUTE_HIDDEN
+            str(os_path(path)), FILE_ATTRIBUTE_HIDDEN
         )
     except (OSError, AttributeError):
         pass
@@ -756,12 +831,80 @@ def unhide_file(path):
         import ctypes
 
         FILE_ATTRIBUTE_HIDDEN = 0x2
+        path = os_path(path)
         attributes = os.stat(path).st_file_attributes
         ctypes.windll.kernel32.SetFileAttributesW(
             str(path), attributes & ~FILE_ATTRIBUTE_HIDDEN
         )
     except (OSError, AttributeError):
         pass
+
+
+def make_writable(path):
+    """Clear the read-only mark copystat copied from the source (Windows).
+
+    A song marked read-only on the stick would otherwise stay read-only on
+    the PC, so MusicBee couldn't save tag edits to it, and a failed copy's
+    partial file couldn't be removed.
+    """
+    if not IS_WINDOWS:
+        return
+
+    try:
+        mode = os.stat(path).st_mode
+
+        if not mode & stat.S_IWRITE:
+            os.chmod(path, mode | stat.S_IWRITE)
+    except OSError:
+        pass
+
+
+def remove_partial(path):
+    """Remove a partial file an earlier, interrupted copy left behind.
+
+    On Windows it is hidden, and Windows won't open a hidden file for
+    writing, so it would block the next copy of that song.
+    """
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except PermissionError:
+        make_writable(path)
+
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+def rename_into_place(temporary, destination, attempts=10):
+    """Rename the finished copy. Returns False if destination appeared.
+
+    On Windows a virus scanner or the search indexer often still has a file
+    open for a moment after it was written, which makes the rename fail, so
+    it is tried again for a few seconds before giving up.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            os.rename(temporary, destination)
+            return True
+        except FileExistsError:
+            # Windows never replaces an existing file on rename.
+            return False
+        except PermissionError as error:
+            if (
+                not IS_WINDOWS
+                or getattr(error, "winerror", None) not in WINDOWS_IN_USE_ERRORS
+                or attempt == attempts
+            ):
+                raise
+
+            time.sleep(0.1 * attempt)
+
+    return False
 
 
 def ensure_parent(destination_root, relative):
@@ -780,7 +923,7 @@ def ensure_parent(destination_root, relative):
         folder = folder / part
 
         try:
-            folder.mkdir()
+            Path(os_path(folder)).mkdir()
         except FileExistsError:
             pass
         except FileNotFoundError as error:
@@ -810,19 +953,22 @@ def copy_item(item, destination_root, on_bytes=None, should_cancel=None):
     """Copy one planned item. Returns False if it appeared in the meantime."""
     ensure_parent(destination_root, item.target)
     destination = destination_root / item.target
+    long_destination = os_path(destination)
 
-    if os.path.lexists(destination):
+    if os.path.lexists(long_destination):
         return False
 
     if item.is_symlink:
-        os.symlink(os.readlink(item.source), destination)
+        os.symlink(os.readlink(item.source), long_destination)
         drop_appledouble(destination)
         return True
 
     temporary = partial_path(destination)
+    long_temporary = os_path(temporary)
+    remove_partial(long_temporary)
 
     try:
-        with open(item.source, "rb") as reader, open(temporary, "wb") as writer:
+        with open(item.source, "rb") as reader, open(long_temporary, "wb") as writer:
             hide_file(temporary)
 
             while True:
@@ -840,24 +986,23 @@ def copy_item(item, destination_root, on_bytes=None, should_cancel=None):
                     on_bytes(len(chunk))
 
         try:
-            shutil.copystat(item.source, temporary)
+            shutil.copystat(item.source, long_temporary)
         except OSError:
             # Some drives (e.g. exFAT) can't hold every macOS flag or
             # timestamp; the file contents are what matter.
             pass
 
-        if os.path.lexists(destination):
-            os.unlink(temporary)
+        make_writable(long_temporary)
+
+        if os.path.lexists(long_destination) or not rename_into_place(
+            long_temporary, long_destination
+        ):
+            os.unlink(long_temporary)
             drop_appledouble(temporary)
             return False
 
-        os.rename(temporary, destination)
-
     except BaseException:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
+        remove_partial(long_temporary)
         drop_appledouble(temporary)
         raise
 
@@ -1278,13 +1423,13 @@ def better_folder_match(source, destination):
         message = (
             "\"" + str(folder) + "\" already has " + f"{shared:,}"
             + " of the same folders as your music folder. Choose it as the "
-            "destination, or this backup will copy your music a second time."
+            "destination, or this will copy your music a second time."
         )
     else:
         message = (
             "The destination matches \"" + str(folder) + "\" inside your "
             "music folder (" + f"{shared:,}" + " of the same folders). Choose "
-            "it as the music folder, or this backup will copy your music a "
+            "it as the music folder, or this will copy your music a "
             "second time."
         )
 
@@ -1297,25 +1442,8 @@ def list_drive_roots():
     On Windows that is every drive letter except the system drive; elsewhere
     it is each volume under /Volumes (macOS) or /media and /mnt (Linux).
     """
-    if os.name == "nt":
-        import string
-
-        system = os.environ.get("SystemDrive", "C:").rstrip("\\/").upper()
-        roots = []
-
-        for letter in string.ascii_uppercase:
-            if letter + ":" == system:
-                continue
-
-            root = Path(letter + ":\\")
-
-            try:
-                if root.exists():
-                    roots.append(root)
-            except OSError:
-                continue
-
-        return roots
+    if IS_WINDOWS:
+        return windows_drive_roots()
 
     roots = []
 
@@ -1327,6 +1455,73 @@ def list_drive_roots():
             )
         except OSError:
             continue
+
+    return roots
+
+
+DRIVE_UNKNOWN = 0
+DRIVE_NO_ROOT_DIR = 1
+DRIVE_REMOTE = 4
+
+
+def windows_drive_roots():
+    """Local drives with a letter, except the system drive.
+
+    This runs every time the window comes to the front, so it must be quick:
+    letters in use come from GetLogicalDrives instead of trying all 26, and
+    network drives are left out, since one whose server is away can take
+    many seconds to answer (and a USB stick is never one). An empty card
+    reader or DVD drive must not pop up "There is no disk in the drive".
+    """
+    import ctypes
+    import string
+
+    system = os.environ.get("SystemDrive", "C:").rstrip("\\/").upper()
+    roots = []
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        mask = kernel32.GetLogicalDrives()
+    except (AttributeError, OSError):
+        kernel32 = None
+        mask = (1 << 26) - 1
+
+    SEM_FAILCRITICALERRORS = 0x0001
+    SEM_NOOPENFILEERRORBOX = 0x8000
+    old_mode = ctypes.c_uint(0)
+
+    try:
+        if kernel32 is not None:
+            kernel32.SetThreadErrorMode(
+                SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX,
+                ctypes.byref(old_mode),
+            )
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        for index, letter in enumerate(string.ascii_uppercase):
+            if not mask & (1 << index) or letter + ":" == system:
+                continue
+
+            root = letter + ":\\"
+
+            if kernel32 is not None and kernel32.GetDriveTypeW(root) in (
+                DRIVE_UNKNOWN, DRIVE_NO_ROOT_DIR, DRIVE_REMOTE,
+            ):
+                continue
+
+            try:
+                if os.path.isdir(root):
+                    roots.append(Path(root))
+            except OSError:
+                continue
+    finally:
+        try:
+            if kernel32 is not None:
+                kernel32.SetThreadErrorMode(old_mode.value, None)
+        except (AttributeError, OSError):
+            pass
 
     return roots
 
@@ -1432,15 +1627,74 @@ def latest_playlists_folder(root):
     return None
 
 
+FOLDERID_MUSIC = "4BD8D571-6D19-48D3-BE97-422220080E43"
+
+
+def windows_music_folder():
+    """The user's Music folder as Windows has it, or None.
+
+    It isn't always ~\\Music: OneDrive's folder backup moves it to
+    ~\\OneDrive\\Music, and it can be moved to another drive in its
+    Properties. MusicBee keeps its library in the real one.
+    """
+    if not IS_WINDOWS:
+        return None
+
+    try:
+        import ctypes
+        import uuid
+        from ctypes import wintypes
+
+        guid = (ctypes.c_ubyte * 16).from_buffer_copy(
+            uuid.UUID(FOLDERID_MUSIC).bytes_le
+        )
+        pointer = ctypes.c_void_p()
+        shell32 = ctypes.windll.shell32
+        shell32.SHGetKnownFolderPath.argtypes = [
+            ctypes.c_void_p, wintypes.DWORD, wintypes.HANDLE,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+
+        if shell32.SHGetKnownFolderPath(
+            ctypes.byref(guid), 0, None, ctypes.byref(pointer)
+        ) != 0:
+            return None
+
+        try:
+            folder = ctypes.wstring_at(pointer.value)
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(pointer)
+
+        return Path(folder) if folder else None
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def user_music_folder():
+    """This user's Music folder."""
+    folder = windows_music_folder()
+
+    if folder is not None and folder.is_dir():
+        return folder
+
+    return Path.home() / "Music"
+
+
 def default_import_folder():
     """Where music is imported to on this computer by default."""
-    return Path.home() / "Music" / "Apple Music Library"
+    return user_music_folder() / "Apple Music Library"
 
 
 def musicbee_playlists_folder():
     """MusicBee's own Playlists folder, if MusicBee has been set up here."""
-    folder = Path.home() / "Music" / "MusicBee" / "Playlists"
-    return folder if folder.is_dir() else None
+    for music in dict.fromkeys((user_music_folder(), Path.home() / "Music")):
+        folder = music / "MusicBee" / "Playlists"
+
+        if folder.is_dir():
+            return folder
+
+    return None
 
 
 def load_playlist_state(state_file):
@@ -1516,7 +1770,7 @@ def _add_playlists(playlists_folder, target_folder, mine, counts):
                 playlists_folder / entry.replace("\\", os.sep).replace("/", os.sep)
             ))
 
-            if track.is_file():
+            if os.path.isfile(os_path(track)):
                 lines.append(str(track))
                 tracks += 1
             else:

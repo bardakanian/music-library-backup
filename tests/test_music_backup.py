@@ -2,6 +2,7 @@ import errno
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from datetime import datetime
@@ -34,19 +35,29 @@ class WindowsNameTests(unittest.TestCase):
         self.assertEqual(copy_core.windows_part("COM1"), "_COM1")
         self.assertEqual(copy_core.windows_part("Console.mp3"), "Console.mp3")
 
+    def test_every_reserved_device_name_gets_a_prefix(self):
+        for name in ("COM0.mp3", "lpt0", "COM\u00b9.m4a", "LPT\u00b3", "CONIN$", "conout$.txt"):
+            self.assertTrue(copy_core.windows_part(name).startswith("_"), name)
+
+        self.assertEqual(copy_core.windows_part("COM10.mp3"), "COM10.mp3")
+
     def test_names_are_normalized_to_nfc(self):
         decomposed = "Beyonce\u0301"
         self.assertEqual(copy_core.windows_part(decomposed), "Beyonc\u00e9")
 
     def test_windows_path_length_counts_from_the_drive(self):
-        length = copy_core.windows_path_length(
-            Path("/Volumes/STICK/Music"), Path("A/b.mp3")
-        )
+        destination = "E:\\Music" if copy_core.IS_WINDOWS else "/Volumes/STICK/Music"
+        length = copy_core.windows_path_length(Path(destination), Path("A/b.mp3"))
         self.assertEqual(length, len("E:\\Music\\A\\b.mp3"))
 
 
 class FolderTestCase(unittest.TestCase):
     def setUp(self):
+        if copy_core.IS_WINDOWS:
+            # "AC:DC" and "Bells?" can only exist on a Mac drive, and the
+            # backup (the code these tests cover) runs on the Mac.
+            self.skipTest("needs file names Windows doesn't allow")
+
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
@@ -267,13 +278,16 @@ class AppleDoubleTests(FolderTestCase):
 
 
 class CancellableRunTests(unittest.TestCase):
+    # The running Python stands in for sleep and echo, which Windows lacks.
     def test_cancel_kills_the_command(self):
         with self.assertRaises(copy_core.Cancelled):
-            copy_core.run_cancellable(["sleep", "30"], lambda: True)
+            copy_core.run_cancellable(
+                [sys.executable, "-c", "import time; time.sleep(30)"], lambda: True
+            )
 
     def test_output_is_returned(self):
         self.assertEqual(
-            copy_core.run_cancellable(["echo", "hi"]),
+            copy_core.run_cancellable([sys.executable, "-c", "print('hi')"]),
             (0, "hi\n", ""),
         )
 
