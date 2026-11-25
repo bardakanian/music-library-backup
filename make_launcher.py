@@ -93,11 +93,24 @@ def write_icon(resources_dir):
         )
 
 
+def clear_stale_bundles(output_dir, keep):
+    """Remove earlier bundles of this app left in output_dir under another name.
+
+    build_bundle only replaces the bundle it is about to write, so renaming the
+    app used to strand the old one here forever.
+    """
+    for candidate in sorted(Path(output_dir).glob("*.app")):
+        if candidate != keep and is_our_bundle(candidate):
+            shutil.rmtree(candidate, ignore_errors=True)
+
+
 def build_bundle(output_dir):
     """Write the .app into output_dir and return its path."""
     QApplication.instance() or QApplication([])
 
     bundle = Path(output_dir) / BUNDLE_NAME
+
+    clear_stale_bundles(Path(output_dir), keep=bundle)
 
     if bundle.exists():
         shutil.rmtree(bundle)
@@ -177,13 +190,18 @@ def main():
     )
     args = parser.parse_args()
 
-    BUILD_DIR.mkdir(exist_ok=True)
-    bundle = build_bundle(BUILD_DIR)
-    print("Built " + str(bundle) + " (version " + app_qt.VERSION + ")")
+    if args.no_install:
+        BUILD_DIR.mkdir(exist_ok=True)
+        bundle = build_bundle(BUILD_DIR)
+        print("Built " + str(bundle) + " (version " + app_qt.VERSION + ")")
+        return
 
-    if not args.no_install:
+    # Stage in a temporary folder so installing leaves no duplicate behind.
+    with tempfile.TemporaryDirectory() as staging:
+        bundle = build_bundle(Path(staging))
+        print("Built " + BUNDLE_NAME + " (version " + app_qt.VERSION + ")")
         target = install(bundle)
-        print("Installed " + str(target))
+    print("Installed " + str(target))
 
 
 if __name__ == "__main__":

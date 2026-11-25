@@ -58,7 +58,7 @@ from copy_core import format_size
 APP_NAME = "Music Library Backup"
 
 # Bump with every change and add a matching entry to CHANGELOG.md.
-VERSION = "2.3.4"
+VERSION = "2.3.5"
 
 IS_WINDOWS = sys.platform == "win32"
 

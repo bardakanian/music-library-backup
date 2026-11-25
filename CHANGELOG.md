@@ -2,6 +2,11 @@ Bump `VERSION` in `app_qt.py` and add an entry here with every change.
 
 # Changelog
 
+## 2.3.5 — 2026-11-24
+
+- Fix: installing the app no longer leaves a second copy of it behind in the project folder. The installer built the bundle in `build/` and then copied it into Applications, so every install produced an identical twin that duplicate scanners flagged. It now builds in a temporary folder that is discarded after installing. `--no-install` still writes to `build/` as before.
+- Fix: a bundle left in `build/` under an older app name is now removed on the next build instead of lingering forever.
+
 ## 2.3.4 — 2026-11-14
 
 Windows fixes:
